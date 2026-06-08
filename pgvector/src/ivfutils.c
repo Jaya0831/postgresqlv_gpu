@@ -10,35 +10,6 @@
 #include "storage/bufmgr.h"
 
 /*
- * Allocate a vector array
- */
-VectorArray
-VectorArrayInit(int maxlen, int dimensions, Size itemsize)
-{
-	VectorArray res = palloc(sizeof(VectorArrayData));
-
-	/* Ensure items are aligned to prevent UB */
-	itemsize = MAXALIGN(itemsize);
-
-	res->length = 0;
-	res->maxlen = maxlen;
-	res->dim = dimensions;
-	res->itemsize = itemsize;
-	res->items = palloc_extended(maxlen * itemsize, MCXT_ALLOC_ZERO | MCXT_ALLOC_HUGE);
-	return res;
-}
-
-/*
- * Free a vector array
- */
-void
-VectorArrayFree(VectorArray arr)
-{
-	pfree(arr->items);
-	pfree(arr);
-}
-
-/*
  * Get the number of lists in the index
  */
 int

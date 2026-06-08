@@ -1,0 +1,29 @@
+CompileFlags:
+  # Point clangd at the non-root compile_commands.json
+  CompilationDatabase: pgvector
+  # Remove or silence GCC-only flags that may confuse clang's parser
+  Remove: [
+    "-Wimplicit-fallthrough=*",
+    "-Wcast-function-type",
+    "-Wmissing-format-attribute",
+    "-Wendif-labels",
+    "-Wdeclaration-after-statement",
+    "-fexcess-precision=standard"
+  ]
+  Add: [
+    "-Wno-unknown-warning-option"
+  ]
+
+If:
+  PathMatch: ["pgvector/.*"]
+  CompileFlags:
+    Add: [
+      "-std=gnu17"
+    ]
+
+If:
+  PathMatch: ["pgvector/src/.*\\.cpp", "pgvector/src/.*\\.hpp"]
+  CompileFlags:
+    Add: [
+      "-std=c++17"
+    ]

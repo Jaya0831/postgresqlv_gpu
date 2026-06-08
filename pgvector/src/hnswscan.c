@@ -8,72 +8,9 @@
 #include "utils/float.h"
 #include "utils/memutils.h"
 
-/*
- * Algorithm 5 from paper
- */
-static List *
-GetScanItems(IndexScanDesc scan, Datum value)
-{
-	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
-	Relation	index = scan->indexRelation;
-	HnswSupport *support = &so->support;
-	List	   *ep;
-	List	   *w;
-	int			m;
-	HnswElement entryPoint;
-	char	   *base = NULL;
-	HnswQuery  *q = &so->q;
+#include "lsmindex.h"
 
-	/* Get m and entry point */
-	HnswGetMetaPageInfo(index, &m, &entryPoint);
-
-	q->value = value;
-	so->m = m;
-
-	if (entryPoint == NULL)
-		return NIL;
-
-	ep = list_make1(HnswEntryCandidate(base, entryPoint, q, index, support, false));
-
-	for (int lc = entryPoint->level; lc >= 1; lc--)
-	{
-		w = HnswSearchLayer(base, q, ep, 1, lc, index, support, m, false, NULL, NULL, NULL, true, NULL);
-		ep = w;
-	}
-
-	return HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples);
-}
-
-/*
- * Resume scan at ground level with discarded candidates
- */
-static List *
-ResumeScanItems(IndexScanDesc scan)
-{
-	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
-	Relation	index = scan->indexRelation;
-	List	   *ep = NIL;
-	char	   *base = NULL;
-	int			batch_size = hnsw_ef_search;
-
-	if (pairingheap_is_empty(so->discarded))
-		return NIL;
-
-	/* Get next batch of candidates */
-	for (int i = 0; i < batch_size; i++)
-	{
-		HnswSearchCandidate *sc;
-
-		if (pairingheap_is_empty(so->discarded))
-			break;
-
-		sc = HnswGetSearchCandidate(w_node, pairingheap_remove_first(so->discarded));
-
-		ep = lappend(ep, sc);
-	}
-
-	return HnswSearchLayer(base, &so->q, ep, batch_size, 0, index, &so->support, so->m, false, NULL, &so->v, &so->discarded, false, &so->tuples);
-}
+#include "portability/instr_time.h"
 
 /*
  * Get scan value
@@ -101,17 +38,6 @@ GetScanValue(IndexScanDesc scan)
 
 	return value;
 }
-
-#if defined(HNSW_MEMORY)
-/*
- * Show memory usage
- */
-static void
-ShowMemoryUsage(HnswScanOpaque so)
-{
-	elog(INFO, "memory: %zu KB, tuples: " INT64_FORMAT, MemoryContextMemAllocated(so->tmpCtx, false) / 1024, so->tuples);
-}
-#endif
 
 /*
  * Prepare for an index scan
@@ -156,13 +82,16 @@ void
 hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norderbys)
 {
 	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
+	
+	// if (!so->first && so->topkTuples.pairs != NULL)
+	// {
+	// 	elog(DEBUG1, "[hnswrescan] checkpoint 01, so->first? %d, so->topkTuples.pairs != NULL? %d", so->first, so->topkTuples.pairs != NULL);
+	// 	pfree(so->topkTuples.pairs);
+	// 	elog(DEBUG1, "[hnswrescan] checkpoint 1");
+	// }
+	// elog(DEBUG1, "[hnswrescan] checkpoint 2");
 
 	so->first = true;
-	/* v and discarded are allocated in tmpCtx */
-	so->v.tids = NULL;
-	so->discarded = NULL;
-	so->tuples = 0;
-	so->previousDistance = -get_float8_infinity();
 	MemoryContextReset(so->tmpCtx);
 
 	if (keys && scan->numberOfKeys > 0)
@@ -189,6 +118,11 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 
 	if (so->first)
 	{
+		// TODO: for evaluation
+		// Timing instrumentation - measure total function execution time
+		instr_time start_time;
+		INSTR_TIME_SET_CURRENT(start_time);
+
 		Datum		value;
 
 		/* Count index scan for stats */
@@ -206,111 +140,80 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		/* Get scan value */
 		value = GetScanValue(scan);
 
-		/*
-		 * Get a shared lock. This allows vacuum to ensure no in-flight scans
-		 * before marking tuples as deleted.
-		 */
-		LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+		// /*
+		//  * Get a shared lock. This allows vacuum to ensure no in-flight scans
+		//  * before marking tuples as deleted.
+		//  */
+		// LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
 
-		so->w = GetScanItems(scan, value);
+		// so->w = GetScanItems(scan, value);
 
-		/* Release shared lock */
-		UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+		// /* Release shared lock */
+		// UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
 
+		// conduct hnsw search
+		Vector *query_vector = (Vector *) PointerGetDatum(value);
+		// FIXME: how are we going to set top_k?
+		int top_k = 100;
+
+		so->topkTuples = search_lsm_index(scan->indexRelation, query_vector->x, top_k, hnsw_ef_search);
+		so->topkTuplesIdx = 0;	
 		so->first = false;
 
-#if defined(HNSW_MEMORY)
-		ShowMemoryUsage(so);
-#endif
+		// TODO: for evaluation
+		// Timing instrumentation - calculate and log execution time
+		instr_time end_time;
+		INSTR_TIME_SET_CURRENT(end_time);
+		INSTR_TIME_SUBTRACT(end_time, start_time);
+		
+		// Thread-local arrays to store last 10000 execution times (per thread)
+		static __thread long execution_times[10000];
+		static __thread int call_count = 0;
+		static __thread int array_index = 0;
+		const int interval = 10000;
+		
+		// Convert to microseconds
+		long duration_us = (long)(INSTR_TIME_GET_MICROSEC(end_time));
+		
+		// Store current execution time
+		execution_times[array_index] = duration_us;
+		array_index = (array_index + 1) % interval;
+		call_count++;
+		
+		// Log statistics every 10000 calls
+		if (call_count % interval == 0) {
+			long total_time = 0;
+			long min_time = LONG_MAX;
+			long max_time = 0;
+			
+			// Calculate stats for the last 10000 calls
+			for (int i = 0; i < interval; i++) {
+				total_time += execution_times[i];
+				if (execution_times[i] < min_time) min_time = execution_times[i];
+				if (execution_times[i] > max_time) max_time = execution_times[i];
+			}
+			
+			double avg_time = (double)total_time / (double)interval;
+			fprintf(stderr, "[search_lsm_index] Stats for last %d calls - Avg: %.2fμs, Min: %ldμs, Max: %ldμs\n", 
+				interval, avg_time, min_time, max_time);
+		}
+		// TODO: for evaluation (end here)
+
 	}
 
-	for (;;)
+	// return the next tuple from the results of hnsw search
+	if (so->topkTuplesIdx < so->topkTuples.num_results)
 	{
-		char	   *base = NULL;
-		HnswSearchCandidate *sc;
-		HnswElement element;
-		ItemPointer heaptid;
-
-		if (list_length(so->w) == 0)
-		{
-			if (hnsw_iterative_scan == HNSW_ITERATIVE_SCAN_OFF)
-				break;
-
-			/* Empty index */
-			if (so->discarded == NULL)
-				break;
-
-			/* Reached max number of tuples or memory limit */
-			if (so->tuples >= hnsw_max_scan_tuples || MemoryContextMemAllocated(so->tmpCtx, false) > so->maxMemory)
-			{
-				if (pairingheap_is_empty(so->discarded))
-					break;
-
-				/* Return remaining tuples */
-				so->w = lappend(so->w, HnswGetSearchCandidate(w_node, pairingheap_remove_first(so->discarded)));
-			}
-			else
-			{
-				/*
-				 * Locking ensures when neighbors are read, the elements they
-				 * reference will not be deleted (and replaced) during the
-				 * iteration.
-				 *
-				 * Elements loaded into memory on previous iterations may have
-				 * been deleted (and replaced), so when reading neighbors, the
-				 * element version must be checked.
-				 */
-				LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
-
-				so->w = ResumeScanItems(scan);
-
-				UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
-
-#if defined(HNSW_MEMORY)
-				ShowMemoryUsage(so);
-#endif
-			}
-
-			if (list_length(so->w) == 0)
-				break;
-		}
-
-		sc = llast(so->w);
-		element = HnswPtrAccess(base, sc->element);
-
-		/* Move to next element if no valid heap TIDs */
-		if (element->heaptidsLength == 0)
-		{
-			so->w = list_delete_last(so->w);
-
-			/* Mark memory as free for next iteration */
-			if (hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF)
-			{
-				pfree(element);
-				pfree(sc);
-			}
-
-			continue;
-		}
-
-		heaptid = &element->heaptids[--element->heaptidsLength];
-
-		if (hnsw_iterative_scan == HNSW_ITERATIVE_SCAN_STRICT)
-		{
-			if (sc->distance < so->previousDistance)
-				continue;
-
-			so->previousDistance = sc->distance;
-		}
+		ItemPointerData heaptid_data = Int64ToItemPointer(so->topkTuples.pairs[so->topkTuplesIdx++].id);
 
 		MemoryContextSwitchTo(oldCtx);
-
-		scan->xs_heaptid = *heaptid;
+		scan->xs_heaptid = heaptid_data;
 		scan->xs_recheck = false;
 		scan->xs_recheckorderby = false;
 		return true;
 	}
 
+	// TODO: do iterative search if necessary and enable
 	MemoryContextSwitchTo(oldCtx);
 	return false;
 }
@@ -325,6 +228,12 @@ hnswendscan(IndexScanDesc scan)
 
 	MemoryContextDelete(so->tmpCtx);
 
-	pfree(so);
+	// pfree(so->topkTuples.pairs); // already freed by MemoryContextDelete
+
+	// Free the scan opaque structure
+	if (so != NULL)
+	{
+		pfree(so);
+	}
 	scan->opaque = NULL;
 }

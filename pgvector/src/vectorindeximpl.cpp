@@ -1,0 +1,1878 @@
+#include "vectorindeximpl.hpp"
+#include <stdio.h>
+
+// --- Fix PostgreSQL atomic macro collisions with C++ standard library ---
+// These must be undefined before including any C++ headers that use <atomic>
+#ifdef atomic_is_lock_free
+#undef atomic_is_lock_free
+#endif
+#ifdef atomic_load_explicit
+#undef atomic_load_explicit
+#endif
+#ifdef atomic_load
+#undef atomic_load
+#endif
+#ifdef atomic_store_explicit
+#undef atomic_store_explicit
+#endif
+#ifdef atomic_store
+#undef atomic_store
+#endif
+#ifdef atomic_exchange_explicit
+#undef atomic_exchange_explicit
+#endif
+#ifdef atomic_exchange
+#undef atomic_exchange
+#endif
+#ifdef atomic_compare_exchange_strong_explicit
+#undef atomic_compare_exchange_strong_explicit
+#endif
+#ifdef atomic_compare_exchange_strong
+#undef atomic_compare_exchange_strong
+#endif
+#ifdef atomic_compare_exchange_weak_explicit
+#undef atomic_compare_exchange_weak_explicit
+#endif
+#ifdef atomic_compare_exchange_weak
+#undef atomic_compare_exchange_weak
+#endif
+
+#include "knowhere/comp/index_param.h"
+#include "lsmindex.h"
+#include "lsm_segment.h"
+#include "utils/elog.h"
+#include "vector.h"
+#include "ringbuffer.h"
+#include "storage/proc.h"
+
+#include <cassert>
+#include <cstdio>
+#include <cstdlib>
+#include <random>
+#include <stdint.h>
+#include <vector>
+#include <algorithm>
+#include <utility>
+#include <queue>
+#include <string>
+// TODO: for evaluation
+#include <chrono>
+#include <iostream>
+
+// --- Fix gettext macro collisions when some headers pull in <libintl.h> ---
+#ifdef gettext
+#undef gettext
+#endif
+#ifdef dgettext
+#undef dgettext
+#endif
+#ifdef ngettext
+#undef ngettext
+#endif
+#ifdef dngettext
+#undef dngettext
+#endif
+
+// Now **temporarily** remove PG's severities only around glog/Knowhere.
+#if defined(INFO) || defined(WARNING) || defined(ERROR)
+  #pragma push_macro("INFO")
+  #pragma push_macro("WARNING")
+  #pragma push_macro("ERROR")
+  #undef INFO
+  #undef WARNING
+  #undef ERROR
+#endif
+
+// Keep glog's own severities usable without abbreviations conflict
+#define GLOG_NO_ABBREVIATED_SEVERITIES 1
+
+// Include glog export header to define GLOG_EXPORT and GLOG_NO_EXPORT
+// This must be done before including knowhere headers that include glog
+#include "glog/export.h"
+
+// Workaround for glog argument limit - Folly uses COMPACT_GOOGLE_LOG_22 which doesn't exist
+// Define a fallback that uses COMPACT_GOOGLE_LOG_0 (the base macro)
+// This is a workaround for Folly's use of more arguments than glog supports
+// Note: This may cause some logging arguments to be ignored, but allows compilation to proceed
+#ifndef COMPACT_GOOGLE_LOG_22
+#define COMPACT_GOOGLE_LOG_22 COMPACT_GOOGLE_LOG_0
+#endif
+
+// Workaround for Folly macro conflicts with PostgreSQL
+// PostgreSQL's foreach macro uses ##__state which conflicts with Folly's token pasting
+// We need to undefine it before including knowhere/Folly headers
+#ifdef foreach
+#undef foreach
+#define PG_FOREACH_UNDEFINED
+#endif
+
+// knowhere (these headers pull in Folly)
+#include "knowhere/bitsetview.h"
+#include "knowhere/index/index.h"
+#include "knowhere/index/index_factory.h"
+#include "knowhere/binaryset.h"
+#include "simd/hook.h"
+#include "knowhere/comp/brute_force.h"
+#include "knowhere/comp/thread_pool.h"
+#include "knowhere/comp/local_file_manager.h"
+#include <atomic>
+#include <memory>
+#include <thread>
+#include <folly/executors/CPUThreadPoolExecutor.h>
+#include <folly/executors/thread_factory/NamedThreadFactory.h>
+
+#ifdef __GNUC__
+#pragma GCC diagnostic pop
+#endif
+
+// Note: We don't restore the foreach macro here because:
+// 1. It's not used in this C++ file
+// 2. Restoring it would require including pg_list.h which causes conflicts with C++ headers
+// If foreach is needed elsewhere, it will be redefined when those headers are included
+#ifdef PG_FOREACH_UNDEFINED
+#undef PG_FOREACH_UNDEFINED
+#endif
+
+// Restore PG's macros so elog.h and friends keep working everywhere else.
+#if defined(__clang__) || defined(__GNUC__)
+  #pragma pop_macro("ERROR")
+  #pragma pop_macro("WARNING")
+  #pragma pop_macro("INFO")
+#endif
+
+// TODO: support different distance metrics
+
+struct FileIOWriter {
+    std::fstream fs;
+    std::string name;
+
+    explicit FileIOWriter(const std::string& fname) {
+        name = fname;
+        fs = std::fstream(name, std::ios::out | std::ios::binary);
+    }
+
+    ~FileIOWriter() {
+        fs.close();
+    }
+
+    size_t
+    operator()(void* ptr, size_t size) {
+        fs.write(reinterpret_cast<char*>(ptr), size);
+        return size;
+    }
+};
+
+struct FileIOReader {
+    std::fstream fs;
+    std::string name;
+
+    explicit FileIOReader(const std::string& fname) {
+        name = fname;
+        fs = std::fstream(name, std::ios::in | std::ios::binary);
+    }
+
+    ~FileIOReader() {
+        fs.close();
+    }
+
+    size_t
+    operator()(void* ptr, size_t size) {
+        fs.read(reinterpret_cast<char*>(ptr), size);
+        return size;
+    }
+
+    size_t
+    size() {
+        fs.seekg(0, fs.end);
+        size_t len = fs.tellg();
+        fs.seekg(0, fs.beg);
+        return len;
+    }
+};
+
+static void
+write_binary_set(knowhere::BinarySet& binary_set, const std::string& filename) {
+    FileIOWriter writer(filename);
+    
+    const auto& m = binary_set.binary_map_;
+    for (auto it = m.begin(); it != m.end(); ++it) {
+        const std::string& name = it->first;
+        size_t name_size = name.length();
+        const knowhere::BinaryPtr data = it->second;
+        size_t data_size = data->size;
+
+        writer(&name_size, sizeof(name_size));
+        writer(&data_size, sizeof(data_size));
+        writer((void*)name.c_str(), name_size);
+        writer(data->data.get(), data_size);
+    }
+}
+
+static void
+read_binary_set(knowhere::BinarySet& binary_set, const std::string& filename) {
+    FileIOReader reader(filename);
+    int64_t file_size = reader.size();
+    if (file_size < 0) {
+        elog(ERROR, "[read_binary_set] Cannot determine file size: %s", filename.c_str());
+    }
+    if (file_size == 0) {
+        elog(ERROR, "[read_binary_set] Index file is empty: %s", filename.c_str());
+    }
+
+    int64_t offset = 0;
+    while (offset < file_size) {
+        size_t name_size, data_size;
+        reader(&name_size, sizeof(size_t));
+        offset += sizeof(size_t);
+        reader(&data_size, sizeof(size_t));
+        offset += sizeof(size_t);
+
+        std::string name;
+        name.resize(name_size);
+        reader((void*)name.data(), name_size);
+        offset += name_size;
+        auto data = new uint8_t[data_size];
+        reader(data, data_size);
+        offset += data_size;
+
+        std::shared_ptr<uint8_t[]> data_ptr(data);
+        binary_set.Append(name, data_ptr, data_size);
+    }
+}
+
+static void
+write_index(knowhere::Index<knowhere::IndexNode>& index, const std::string& filename) {
+    knowhere::BinarySet binary_set;
+    index.Serialize(binary_set);
+
+    write_binary_set(binary_set, filename);
+}
+
+static void
+read_index(knowhere::Index<knowhere::IndexNode>& index, const std::string& filename, const knowhere::Json& conf) {
+    knowhere::BinarySet binary_set;
+    read_binary_set(binary_set, filename);
+
+    auto status = index.Deserialize(binary_set, conf);
+    if (status != knowhere::Status::success) {
+        elog(ERROR, "[read_index] Deserialize failed with status %d for file: %s",
+             static_cast<int>(status), filename.c_str());
+    }
+}
+
+extern "C" int
+HnswIndexInit(int dimension, int M, int efConstruction, void** hnswIndexPtr)
+{
+    elog(DEBUG1, "enter HnswIndexInit, M = %d, efConstruction = %d", M, efConstruction);
+
+    auto version = knowhere::Version::GetCurrentVersion().VersionNumber();
+#if USE_GPU_CUVS
+    auto kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_CUVS_CAGRA, version).value();
+#else
+    auto kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version).value();
+#endif
+    knowhere::Index<knowhere::IndexNode> * kindex_ptr = new knowhere::Index<knowhere::IndexNode>(kindex);
+    // Return pointer
+    *hnswIndexPtr = static_cast<void*>(kindex_ptr);
+    return 0;
+}
+
+extern "C" int
+HnswIndexcreate(void* hnswIndexPtr, int M, int efConstruction, VectorArray vectors)
+{
+    elog(DEBUG1, "enter HnswIndexCreate, vector_num = %d", vectors->length);
+
+    // knowhere
+    const int64_t nb  = vectors->length;
+    const int64_t dim = vectors->dim;
+
+    // 1) Materialize a contiguous [nb x dim] float buffer
+    std::unique_ptr<float[]> buf(new float[nb * dim]);
+
+    for (int64_t i = 0; i < nb; ++i) {
+        Vector* vec_ptr = (Vector*) VectorArrayGet(vectors, i); // vec_ptr->x points to float[dim]
+        std::memcpy(buf.get() + i * dim, vec_ptr->x, sizeof(float) * dim);
+    }
+    auto dataset = knowhere::GenDataSet(nb, dim, buf.get());
+
+    knowhere::Index<knowhere::IndexNode> *index = static_cast<knowhere::Index<knowhere::IndexNode>*>(hnswIndexPtr);
+
+    // configuration
+    knowhere::Json conf;
+    conf[knowhere::meta::ROWS] = vectors->length;
+    conf[knowhere::meta::DIM] = vectors->dim;
+    conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+#if USE_GPU_CUVS
+    // CAGRA params: map HNSW M/efConstruction to CAGRA GRAPH_DEGREE/INTERMEDIATE_GRAPH_DEGREE
+    conf[knowhere::indexparam::GRAPH_DEGREE] = M;
+    conf[knowhere::indexparam::INTERMEDIATE_GRAPH_DEGREE] = efConstruction;
+    conf[knowhere::indexparam::BUILD_ALGO] = "NN_DESCENT";  // or "IVF_PQ"
+    conf[knowhere::indexparam::NN_DESCENT_NITER] = 20;
+#else
+    conf[knowhere::indexparam::M] = M;
+    conf[knowhere::indexparam::EFCONSTRUCTION] = efConstruction;
+#endif
+
+    /* GPU CAGRA returns 0 when empty; faiss HNSW returns -1. Both need Build on first batch. */
+    if (index->Count() == -1 || index->Count() == 0)
+    {
+        auto build_res = index->Build(dataset, conf);
+        Assert(build_res == knowhere::Status::success);
+        Assert(index->Count() == vectors->length);
+    }
+    else
+    {
+        auto add_res = index->Add(dataset, conf);
+        Assert(add_res == knowhere::Status::success);
+    }
+    return 0;
+}
+
+extern "C" int
+DiskANNIndexInit(int dimension, void** diskannIndexPtr)
+{
+    elog(DEBUG1, "enter DiskANNIndexInit, dimension = %d", dimension);
+
+    auto version = knowhere::Version::GetCurrentVersion().VersionNumber();
+    std::shared_ptr<knowhere::FileManager> file_manager = std::make_shared<knowhere::LocalFileManager>();
+    auto diskann_index_pack = knowhere::Pack(file_manager);
+    auto kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(
+        knowhere::IndexEnum::INDEX_DISKANN, version, diskann_index_pack).value();
+    knowhere::Index<knowhere::IndexNode> * kindex_ptr = new knowhere::Index<knowhere::IndexNode>(kindex);
+    // Return pointer
+    *diskannIndexPtr = static_cast<void*>(kindex_ptr);
+    return 0;
+}
+
+extern "C" int
+DiskANNIndexBuildFromFile(void* diskannIndexPtr, const char* data_path, const char* index_prefix, 
+                          int max_degree, int ef_construction, double pq_code_budget_gb, double build_dram_budget_gb)
+{
+    elog(DEBUG1, "enter DiskANNIndexBuildFromFile, data_path = %s, index_prefix = %s", data_path, index_prefix);
+
+    knowhere::Index<knowhere::IndexNode> *index = static_cast<knowhere::Index<knowhere::IndexNode>*>(diskannIndexPtr);
+
+    // Create index directory if needed
+    std::string prefix_str(index_prefix);
+    size_t last_slash = prefix_str.find_last_of('/');
+    if (last_slash != std::string::npos) {
+        std::string dir_path = prefix_str.substr(0, last_slash);
+    }
+
+    // Configuration for DiskANN build
+    knowhere::Json conf;
+    conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+    conf[knowhere::meta::INDEX_PREFIX] = index_prefix;
+    conf[knowhere::meta::DATA_PATH] = data_path;
+    conf[knowhere::indexparam::MAX_DEGREE] = max_degree;
+    conf[knowhere::indexparam::SEARCH_LIST_SIZE] = ef_construction;  // Use ef_construction for build
+    conf[knowhere::indexparam::PQ_CODE_BUDGET_GB] = pq_code_budget_gb;
+    conf[knowhere::indexparam::BUILD_DRAM_BUDGET_GB] = build_dram_budget_gb;
+
+    // For DiskANN, build directly (data already on disk)
+    knowhere::DataSetPtr ds_ptr = nullptr;
+    auto build_res = index->Build(ds_ptr, conf);
+    if (build_res != knowhere::Status::success) {
+        elog(ERROR, "[DiskANNIndexBuildFromFile] Failed to build DiskANN index");
+        return -1;
+    }
+    
+    return 0;
+}
+
+extern "C" int 
+IvfflatTrain(VectorArray samples, int lists, void** ivfIndexPtr)
+{
+    elog(DEBUG1, "enter IvfflatTrain");
+    
+    const int64_t dim = samples->dim;
+    const int64_t nlist = lists;
+    const int64_t nsamples = samples->length;
+    auto version = knowhere::Version::GetCurrentVersion().VersionNumber();
+#if USE_GPU_CUVS
+    /*
+     * GPU cuvs IVF builds the index in one shot with Build() - it does not support
+     * the Train (samples) + Add (full data) pattern. Train() would build an index
+     * with only the samples; Add() is a no-op. We create an empty index here; the
+     * full index will be built in IvfflatIndexCreate via Build() with all vectors.
+     */
+    auto kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_CUVS_IVFFLAT, version).value();
+    knowhere::Index<knowhere::IndexNode> *kindex_ptr = new knowhere::Index<knowhere::IndexNode>(kindex);
+    /* Do not call Train - leave index empty for Build() in IvfflatIndexCreate */
+#else
+    auto kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_FAISS_IVFFLAT, version).value();
+    knowhere::Index<knowhere::IndexNode> *kindex_ptr = new knowhere::Index<knowhere::IndexNode>(kindex);
+
+    // configuration
+    knowhere::Json conf;
+    conf[knowhere::meta::ROWS] = nsamples;
+    conf[knowhere::meta::DIM] = dim;
+    conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+    conf[knowhere::indexparam::NLIST] = nlist;
+
+    // generate train dataset
+    std::unique_ptr<float[]> buf(new float[nsamples * dim]);
+    for (int64_t i = 0; i < nsamples; ++i) {
+        Vector* vec_ptr = (Vector *) VectorArrayGet(samples, i);
+        std::memcpy(buf.get() + i * dim, vec_ptr->x, sizeof(float) * dim);
+    }
+    auto dataset = knowhere::GenDataSet(nsamples, dim, buf.get());
+
+    auto train_res = kindex_ptr->Train(dataset, conf);
+    Assert(train_res == knowhere::Status::success);
+#endif
+
+    *ivfIndexPtr = static_cast<void*>(kindex_ptr);
+    return 0;
+}
+
+extern "C" int
+IvfflatIndexCreate(void* ivfIndexPtr, VectorArray vectors, int nlist)
+{
+    elog(DEBUG1, "enter IvfflatIndexCreate, vector_num = %d", vectors->length);
+
+    const int64_t nb  = vectors->length;
+    const int64_t dim = vectors->dim;
+
+    std::unique_ptr<float[]> buf(new float[nb * dim]);
+
+    for (int64_t i = 0; i < nb; ++i) {
+        Vector* vec_ptr = (Vector*) VectorArrayGet(vectors, i); // vec_ptr->x points to float[dim]
+        std::memcpy(buf.get() + i * dim, vec_ptr->x, sizeof(float) * dim);
+    }
+    auto dataset = knowhere::GenDataSet(nb, dim, buf.get());
+
+    knowhere::Index<knowhere::IndexNode> *index = static_cast<knowhere::Index<knowhere::IndexNode>*>(ivfIndexPtr);
+
+    knowhere::Json conf;
+    conf[knowhere::meta::ROWS] = nb;
+    conf[knowhere::meta::DIM] = dim;
+    conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+    conf[knowhere::indexparam::NLIST] = nlist;
+
+#if USE_GPU_CUVS
+    /*
+     * GPU cuvs IVF's Add() is a no-op - it does not add vectors to the index.
+     * The cuvs index is built entirely in Train(), which uses the provided data
+     * for both k-means and the index. We must use Build() with the full dataset
+     * to get a complete index. Build() does Train+Add; using it here rebuilds
+     * the index with the full dataset (replacing the training-only index from
+     * IvfflatTrain).
+     */
+    auto build_res = index->Build(dataset, conf);
+    Assert(build_res == knowhere::Status::success);
+#else
+    if (index->Count() == 0 || index->Count() == -1)
+    {
+        auto build_res = index->Build(dataset, conf);
+        Assert(build_res == knowhere::Status::success);
+    }
+    else
+    {
+        auto add_res = index->Add(dataset, conf);
+        Assert(add_res == knowhere::Status::success);
+    }
+#endif
+    return 0;
+}
+
+extern "C" void
+IndexBuild(IndexType type, ConcurrentMemTable mt, uint32_t valid_rows, void** indexPtr, int M, int efConstruction, int lists)
+{
+    elog(DEBUG1, "enter IndexBuild, type = %d, relation = %d, segment id = %d, valid_rows = %d, M = %d, efConstruction = %d, lists = %d",
+         type, mt->rel, mt->memtable_id, valid_rows, M, efConstruction, lists);
+    
+    // DiskANN is not supported in IndexBuild (used for REBUILD_FLAT which should use HNSW instead)
+    if (type == DISKANN)
+    {
+        elog(ERROR, "[IndexBuild] DiskANN is not supported in IndexBuild. Use HNSW for REBUILD_FLAT operations.");
+        return;
+    }
+    
+    // initialize
+    auto version = knowhere::Version::GetCurrentVersion().VersionNumber();
+    knowhere::Index<knowhere::IndexNode> kindex;
+    switch (type)
+    {
+        case FLAT:
+            kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_FAISS_IDMAP, version).value();
+            break;
+        case HNSW:
+#if USE_GPU_CUVS
+            kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_CUVS_CAGRA, version).value();
+#else
+            kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version).value();
+#endif
+            break;
+        case IVFFLAT:
+#if USE_GPU_CUVS
+            kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_CUVS_IVFFLAT, version).value();
+#else
+            kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_FAISS_IVFFLAT, version).value();
+#endif
+            break;
+        case DISKANN:
+            // Should not reach here due to check above, but handle for completeness
+            elog(ERROR, "[IndexBuild] DiskANN is not supported in IndexBuild");
+            return;
+    }
+    knowhere::Index<knowhere::IndexNode> * kindex_ptr = new knowhere::Index<knowhere::IndexNode>(kindex);
+
+    // create
+    auto dataset = knowhere::GenDataSet(valid_rows, mt->dim, VEC_BASE_FROM_MT(mt));
+    knowhere::Index<knowhere::IndexNode> *index = static_cast<knowhere::Index<knowhere::IndexNode>*>(kindex_ptr);
+
+    // configuration
+    knowhere::Json conf;
+    conf[knowhere::meta::ROWS] = valid_rows;
+    conf[knowhere::meta::DIM] = mt->dim;
+    conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+    switch (type)
+    {
+        case FLAT:
+            break;
+        case IVFFLAT:
+            conf[knowhere::indexparam::NLIST] = lists;
+            break;
+        case HNSW:
+#if USE_GPU_CUVS
+            conf[knowhere::indexparam::GRAPH_DEGREE] = M;
+            conf[knowhere::indexparam::INTERMEDIATE_GRAPH_DEGREE] = efConstruction;
+#else
+            conf[knowhere::indexparam::M] = M;
+            conf[knowhere::indexparam::EFCONSTRUCTION] = efConstruction;
+#endif
+            break;
+    }
+
+    auto build_res = index->Build(dataset, conf);
+    Assert(build_res == knowhere::Status::success);
+    Assert(index->Count() == valid_rows);
+
+    *indexPtr = static_cast<void*>(kindex_ptr);
+}
+
+extern "C" int
+IndexFree(void* indexPtr)
+{
+    // elog(DEBUG1, "enter IndexFree");
+    if (indexPtr != nullptr)
+    {
+        auto index = static_cast<knowhere::Index<knowhere::IndexNode>*>(indexPtr);
+        delete index;
+    }
+    return 0;
+}
+
+// FIXME: handle the situaltion when k > total vectors in the index
+static topKVector*
+VectorIndexSearchImpl(IndexType type, void* indexPtr, const knowhere::BitsetView& bitset_view, uint32_t count, const float* query_vector, int k, int efs_nprobe)
+{
+    // fprintf(stderr, "enter VectorIndexSearchImpl, type = %d, index_ptr = %p, count = %d, query_vector = %p, k = %d, efs_nprobe = %d\n", type, indexPtr, count, query_vector, k, efs_nprobe);
+
+    knowhere::Index<knowhere::IndexNode> *index = static_cast<knowhere::Index<knowhere::IndexNode>*>(indexPtr);
+
+    if (index->Count() <= 0)
+    {
+        fprintf(stderr, "IvfflatIndexSearch: the index is empty\n");
+        return nullptr;
+    }
+
+    const int dim = static_cast<int>(index->Dim());
+
+    // configuration (cuVS expects DIM in JSON like knowhere cuvs_tests / benchmarks)
+    knowhere::Json conf;
+    conf[knowhere::meta::TOPK] = k;
+    conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+    conf[knowhere::meta::DIM] = static_cast<int64_t>(dim);
+    switch (type)
+    {
+        case FLAT:
+            break;
+        case IVFFLAT:
+            conf[knowhere::indexparam::NPROBE] = efs_nprobe;
+            break;
+        case HNSW:
+#if USE_GPU_CUVS
+            // CAGRA search: ITOPK_SIZE controls search quality (analogous to HNSW ef); search_algo defaults to AUTO
+            conf[knowhere::indexparam::ITOPK_SIZE] = efs_nprobe;
+            conf[knowhere::indexparam::SEARCH_ALGO] = "MULTI_CTA";
+#else
+            conf[knowhere::indexparam::EF] = efs_nprobe;
+#endif
+            break;
+        case DISKANN:
+            conf[knowhere::indexparam::SEARCH_LIST_SIZE] = efs_nprobe;
+            conf[knowhere::indexparam::BEAMWIDTH] = 8;  // Default beamwidth
+            break;
+        default:
+            fprintf(stderr, "VectorIndexSearch: unsupported index type %d\n", type);
+    }
+
+    // generate query dataset
+    auto dataset = knowhere::GenDataSet(1, dim, query_vector);
+
+    // TODO: for evaluation
+    // Timing instrumentation - measure only the actual search operation
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    // conduct search
+    // knowhere::ThreadPool::ScopedSearchOmpSetter setter(8);  // Set OMP 
+    auto res = index->Search(dataset, conf, bitset_view);
+    
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+
+    // convert knowhere::Dataset to topKVector
+    topKVector* topk_result = (topKVector *) malloc(sizeof(topKVector));
+    topk_result->num_results = k;
+    topk_result->distances = (float *) malloc(sizeof(float) * k);
+    topk_result->vids = (int64_t *) malloc(sizeof(int64_t) * k);
+
+    const int64_t* ids = res.value()->GetIds();
+    const float*   dis = res.value()->GetDistance();
+
+    std::memcpy(topk_result->distances, dis, sizeof(float) * k);
+    std::memcpy(topk_result->vids, ids, sizeof(int64_t) * k);
+
+    // TODO: for evaluation
+    // Timing instrumentation - calculate and log execution time
+    
+    // Thread-local arrays to store last 1000 execution times (per thread)
+    int interval = 1000;
+    thread_local static long execution_times[1000];
+    thread_local static int call_count = 0;
+    thread_local static int array_index = 0;
+    
+    // Store current execution time
+    execution_times[array_index] = duration.count();
+    array_index = (array_index + 1) % interval;
+    call_count++;
+    
+    // Log statistics every 1000 calls
+    if (call_count % interval == 0) {
+        long total_time = 0;
+        long min_time = LONG_MAX;
+        long max_time = 0;
+        
+        // Calculate stats for the last 10000 calls
+        for (int i = 0; i < interval; i++) {
+            total_time += execution_times[i];
+            if (execution_times[i] < min_time) min_time = execution_times[i];
+            if (execution_times[i] > max_time) max_time = execution_times[i];
+        }
+        
+        double avg_time = static_cast<double>(total_time) / (double)interval;
+        fprintf(stderr, "[VectorIndexSearchImpl] Stats for last %d calls - Avg: %.2fμs, Min: %ldμs, Max: %ldμs\n", 
+             interval, avg_time, min_time, max_time);
+    }
+    // TODO: for evaluation (end here)
+
+    return topk_result;
+}
+
+extern "C" topKVector*
+VectorIndexSearch(IndexType type, void *index_ptr, uint8_t *bitmap_ptr, uint32_t count, const float* query_vector, int k, int efs_nprobe)
+{
+    // fprintf(stderr, "enter VectorIndexSearch, type = %d, index_ptr = %p, bitmap_ptr = %p, count = %d, query_vector = %p, k = %d, efs_nprobe = %d\n", type, index_ptr, bitmap_ptr, count, query_vector, k, efs_nprobe);
+
+    // knowhere::BitsetView bitset_view(bitmap_ptr, count);
+    // TODO: for debugging
+    knowhere::BitsetView bitset_view(nullptr);   // no bitmap view
+    return VectorIndexSearchImpl(type, index_ptr, bitset_view, count, query_vector, k, efs_nprobe);
+}
+
+static void
+FreeBinarySet(void* bin)
+{
+    delete static_cast<knowhere::BinarySet*>(bin);
+}
+
+// Helper function to free malloc-allocated topKVector (for thread-safe allocations)
+static void
+free_topk_vector_malloc(topKVector *tkv)
+{
+    if (tkv != nullptr)
+    {
+        if (tkv->distances != nullptr)
+            free(tkv->distances);
+        if (tkv->vids != nullptr)
+            free(tkv->vids);
+        free(tkv);
+    }
+}
+
+static inline Size
+get_required_size(knowhere::BinarySet* bs) {
+    if (!bs) return 0;
+    Size total = 0;
+    const auto& m = bs->binary_map_;
+    for (const auto& kv : m) {
+        const std::string& name = kv.first;
+        const knowhere::BinaryPtr data = kv.second; // shared_ptr<uint8_t[]> + size
+        total += sizeof(size_t)                 // name_size
+               + sizeof(size_t)                 // data_size
+               + name.size()                    // name bytes
+               + data->size;                    // data bytes
+    }
+    // Sentinel {0,0} so a size-less reader can stop.
+    total += sizeof(size_t) + sizeof(size_t);
+    // elog(DEBUG1, "[get_required_size] total size = %ld", total);
+    return total;
+}
+
+static void
+convert_binary_set_to_string(knowhere::BinarySet* bs, void* buf) {
+    // Caller must allocate buf with at least get_total_size(bs) bytes.
+    uint8_t* p = reinterpret_cast<uint8_t*>(buf);
+    const auto& m = bs->binary_map_;
+    for (const auto& kv : m) {
+        const std::string& name = kv.first;
+        const knowhere::BinaryPtr data = kv.second;
+
+        const size_t name_size = name.size();
+        const size_t data_size = data->size;
+
+        std::memcpy(p, &name_size, sizeof(size_t)); p += sizeof(size_t);
+        std::memcpy(p, &data_size, sizeof(size_t)); p += sizeof(size_t);
+
+        if (name_size) {
+            std::memcpy(p, name.data(), name_size);
+            p += name_size;
+        }
+        if (data_size) {
+            std::memcpy(p, data->data.get(), data_size);
+            p += data_size;
+        }
+    }
+
+    // Write sentinel {0,0}
+    const size_t zero = 0;
+    std::memcpy(p, &zero, sizeof(size_t)); p += sizeof(size_t);
+    std::memcpy(p, &zero, sizeof(size_t)); p += sizeof(size_t);
+}
+
+static void
+convert_string_to_binary_set(void* buf, knowhere::BinarySet* bs) {
+    // Expects a buffer produced by convert_binary_set_to_string (ends with sentinel {0,0}).
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(buf);
+
+    while (true) {
+        size_t name_size = 0, data_size = 0;
+
+        std::memcpy(&name_size, p, sizeof(size_t)); p += sizeof(size_t);
+        std::memcpy(&data_size, p, sizeof(size_t)); p += sizeof(size_t);
+
+        // Sentinel: stop.
+        if (name_size == 0 && data_size == 0) {
+            elog(DEBUG1, "[convert_string_to_binary_set] sentinel reached at offset = %ld", (Size) (p - (const uint8_t*)buf));
+            break;
+        }
+
+        std::string name;
+        name.resize(name_size);
+        if (name_size) {
+            std::memcpy(&name[0], p, name_size);
+            p += name_size;
+        }
+
+        // Allocate and copy payload.
+        std::shared_ptr<uint8_t[]> data(new uint8_t[data_size],
+                                        std::default_delete<uint8_t[]>());
+        if (data_size) {
+            std::memcpy(data.get(), p, data_size);
+            p += data_size;
+        }
+        bs->Append(name, data, data_size);
+    }
+}
+
+extern "C" void
+IndexSerialize(void *indexPtr, void **ret_bin_set)
+{
+    auto* index = static_cast<knowhere::Index<knowhere::IndexNode>*>(indexPtr);
+
+    knowhere::BinarySet *bins = new knowhere::BinarySet();
+    auto status = index->Serialize(*bins);
+    if (status != knowhere::Status::success) {
+        delete bins;
+        elog(ERROR, "[IndexSerialize] Serialize failed with status %d", static_cast<int>(status));
+    }
+    *ret_bin_set = static_cast<void*>(bins);
+}
+
+// the index binary set will be free in this function
+extern "C" void
+IndexBinarySetFlush(const char* filename, void *ret_bin_set)
+{
+    knowhere::BinarySet *binary_set = static_cast<knowhere::BinarySet*>(ret_bin_set);
+    write_binary_set(*binary_set, filename);
+    FreeBinarySet(ret_bin_set);
+}
+
+// extern "C" void
+// IndexDeserializeAndSave(void* bin, IndexType index_type, int idx0, int idx1)
+// {
+//     elog(DEBUG1, "enter IndexDeserializeAndSave, index_type = %d, idx0 = %d, idx1 = %d", index_type, idx0, idx1);
+
+//     auto version = knowhere::Version::GetCurrentVersion().VersionNumber();
+//     switch (index_type)
+//     {
+//         case FLAT:
+//         {
+//             auto kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_FAISS_IDMAP, version).value();
+//             knowhere_index[idx0][idx1] = new knowhere::Index<knowhere::IndexNode>(kindex);
+//             break;
+//         }
+//         case IVFFLAT:
+//         {
+//             auto kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_FAISS_IVFFLAT, version).value();
+//             knowhere_index[idx0][idx1] = new knowhere::Index<knowhere::IndexNode>(kindex);
+//             break;
+//         }
+//         case HNSW:
+//         {
+//             auto kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version).value();
+//             knowhere_index[idx0][idx1] = new knowhere::Index<knowhere::IndexNode>(kindex);
+//             break;
+//         }
+//         default:
+//         {
+//             elog(DEBUG1, "[IndexDeserializeAndSave] Unsupported index type");
+//             break;
+//         }
+//     }
+//     knowhere_json[idx0][idx1] = new knowhere::Json();
+//     IndexDeserialize(bin, knowhere_index[idx0][idx1], knowhere_json[idx0][idx1]);
+// }
+
+extern "C" void 
+IndexLoadAndSave(const char* path, IndexType index_type, void** indexPtr)
+{
+    fprintf(stderr, "[IndexLoadAndSave] enter IndexLoadAndSave, index_type = %d\n", index_type);
+    auto version = knowhere::Version::GetCurrentVersion().VersionNumber();
+    
+    knowhere::Json conf;
+    
+    switch (index_type)
+    {
+        case FLAT:
+        {
+            auto kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_FAISS_IDMAP, version).value();
+            read_index(kindex, path, conf);            
+            auto* index = new knowhere::Index<knowhere::IndexNode>(kindex);
+            *indexPtr = static_cast<void*>(index);
+            break;
+        }
+        case IVFFLAT:
+        {
+#if USE_GPU_CUVS
+            auto kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_CUVS_IVFFLAT, version).value();
+#else
+            auto kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_FAISS_IVFFLAT, version).value();
+#endif
+            read_index(kindex, path, conf);
+            auto* index = new knowhere::Index<knowhere::IndexNode>(kindex);
+            *indexPtr = static_cast<void*>(index);
+            break;
+        }
+        case HNSW:
+        {
+#if USE_GPU_CUVS
+            auto kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_CUVS_CAGRA, version).value();
+#else
+            auto kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version).value();
+#endif
+            read_index(kindex, path, conf);
+            auto* index = new knowhere::Index<knowhere::IndexNode>(kindex);
+            *indexPtr = static_cast<void*>(index);
+            break;
+        }
+        case DISKANN:
+        {
+            std::shared_ptr<knowhere::FileManager> file_manager = std::make_shared<knowhere::LocalFileManager>();
+            auto diskann_index_pack = knowhere::Pack(file_manager);
+            auto kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(
+                knowhere::IndexEnum::INDEX_DISKANN, version, diskann_index_pack).value();
+            
+            // Construct DiskANN index prefix directly from path: "<path>_diskann"
+            std::string path_str(path);
+            std::string index_prefix = path_str + "_diskann";
+            conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+            conf[knowhere::meta::INDEX_PREFIX] = index_prefix;
+            // TODO: make this configurable
+            conf[knowhere::indexparam::SEARCH_CACHE_BUDGET_GB] = 5.0f;
+            conf[knowhere::indexparam::BEAMWIDTH] = 8;
+            
+            // Configure AIO context count to avoid hitting system limits
+            // Knowhere's DiskANN implementation initializes a global AioContextPool with 128 contexts by default.
+            // If you see "io_setup() failed; returned -11, errno=11: Resource temporarily unavailable" errors,
+            // it means the system doesn't have enough AIO resources. Solutions:
+            // 1. Increase system limit: sudo sysctl -w fs.aio-max-nr=1048576 (and add to /etc/sysctl.conf)
+            // 2. Set environment variable: export KNOWHERE_AIO_CONTEXT_NUM=32 (before starting PostgreSQL)
+            // 3. Check current usage: cat /proc/sys/fs/aio-nr /proc/sys/fs/aio-max-nr
+            const char* aio_context_num_env = getenv("KNOWHERE_AIO_CONTEXT_NUM");
+            if (aio_context_num_env != nullptr) {
+                int aio_context_num = atoi(aio_context_num_env);
+                if (aio_context_num > 0) {
+                    conf["aio_context_num"] = aio_context_num;
+                    elog(DEBUG1, "[IndexLoadAndSave] Setting AIO context num to %d (from KNOWHERE_AIO_CONTEXT_NUM env)", aio_context_num);
+                }
+            }
+            // Note: The AioContextPool is initialized globally by knowhere when the first DiskANN index is loaded.
+            // If the parameter above doesn't work, you must increase fs.aio-max-nr system limit.
+            
+
+            kindex.Deserialize(knowhere::BinarySet(), conf); // For Diskann, the index does not have a binary set
+            auto* index = new knowhere::Index<knowhere::IndexNode>(kindex);
+            *indexPtr = static_cast<void*>(index);
+            break;
+        }
+        default:
+        {
+            fprintf(stderr, "[IndexLoadAndSave] Unsupported index type\n");
+            break;
+        }
+    }
+}
+
+// ------------------ DiskANN disk file management ------------------
+
+// Structure to hold file handle and metadata
+struct DiskANNFileHandle {
+    std::fstream fs;
+    std::string path;
+    uint32_t dim;
+    uint32_t num_vectors;
+    bool header_written;
+};
+
+extern "C" void*
+DiskANNCreateDataFile(const char* data_path, uint32_t dim)
+{
+    DiskANNFileHandle* handle = new DiskANNFileHandle();
+    handle->path = std::string(data_path);
+    handle->dim = dim;
+    handle->num_vectors = 0;
+    handle->header_written = false;
+    
+    // Open file for writing (binary mode)
+    handle->fs.open(handle->path, std::ios::out | std::ios::binary);
+    if (!handle->fs.is_open()) {
+        delete handle;
+        elog(ERROR, "[DiskANNCreateDataFile] Cannot open file for writing: %s", data_path);
+        return nullptr;
+    }
+    
+    // Write header: num_vectors (uint32_t), dim (uint32_t)
+    // We'll write num_vectors as 0 initially, and update it when closing
+    uint32_t num_vectors_placeholder = 0;
+    handle->fs.write(reinterpret_cast<const char*>(&num_vectors_placeholder), sizeof(uint32_t));
+    handle->fs.write(reinterpret_cast<const char*>(&dim), sizeof(uint32_t));
+    handle->header_written = true;
+    
+    return static_cast<void*>(handle);
+}
+
+extern "C" int
+DiskANNAddVectorsToFile(void* file_handle, const float* vectors, uint32_t num_vectors, uint32_t dim)
+{
+    if (file_handle == nullptr || vectors == nullptr) {
+        elog(ERROR, "[DiskANNAddVectorsToFile] Invalid parameters");
+        return -1;
+    }
+    
+    DiskANNFileHandle* handle = static_cast<DiskANNFileHandle*>(file_handle);
+    
+    if (!handle->fs.is_open()) {
+        elog(ERROR, "[DiskANNAddVectorsToFile] File is not open: %s", handle->path.c_str());
+        return -1;
+    }
+    
+    if (handle->dim != dim) {
+        elog(ERROR, "[DiskANNAddVectorsToFile] Dimension mismatch: expected %u, got %u", handle->dim, dim);
+        return -1;
+    }
+    
+    // Write vectors to file
+    size_t vector_data_size = sizeof(float) * num_vectors * dim;
+    handle->fs.write(reinterpret_cast<const char*>(vectors), vector_data_size);
+    
+    if (!handle->fs.good()) {
+        elog(ERROR, "[DiskANNAddVectorsToFile] Failed to write vectors to file");
+        return -1;
+    }
+    
+    handle->num_vectors += num_vectors;
+    elog(DEBUG1, "[DiskANNAddVectorsToFile] Added %u vectors to file, total number of vectors = %u", num_vectors, handle->num_vectors);
+    return 0;
+}
+
+extern "C" void
+DiskANNCloseDataFile(void* file_handle)
+{
+    if (file_handle == nullptr) {
+        return;
+    }
+    
+    DiskANNFileHandle* handle = static_cast<DiskANNFileHandle*>(file_handle);
+    
+    if (handle->fs.is_open()) {
+        // Update the num_vectors in the header
+        if (handle->header_written) {
+            handle->fs.seekp(0, std::ios::beg);
+            handle->fs.write(reinterpret_cast<const char*>(&handle->num_vectors), sizeof(uint32_t));
+        }
+        
+        handle->fs.close();
+    }
+    
+    delete handle;
+}
+
+// ------------------ brute scan implementation ------------------
+
+extern "C" void
+// currently a native implementation
+ComputeMultipleDistances(const void *vectors, uint32_t vector_num, uint32_t dim,
+                               const float *query_vector, 
+                               float *distances)
+{
+//   elog(DEBUG1, "enter FaissComputeDistances");
+  Assert(vectors != NULL);
+  Assert(query_vector != NULL);
+
+  faiss::fvec_L2sqr_ny(distances, query_vector, (float *)vectors, dim, vector_num);
+}
+
+extern "C" float
+ComputeDistance(const float *a, const float *b, uint32_t dim)
+{
+    Assert(a != NULL);
+    Assert(b != NULL);
+
+    return faiss::fvec_L2sqr(a, b, dim);
+}
+
+extern "C" topKVector*
+BruteForceSearch(const float* vectors, const float* query_vector, const uint8_t *bitmap, int count, int k, int dim)
+{
+    // // TODO: for evaluation
+    // // Timing instrumentation
+    // auto start_time = std::chrono::high_resolution_clock::now();
+
+    auto query_dataset = knowhere::GenDataSet(1, dim, query_vector);
+    auto base_dataset = knowhere::GenDataSet(count, dim, vectors);
+    knowhere::Json conf;
+    conf[knowhere::meta::TOPK] = k;
+    conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+    conf[knowhere::meta::DIM] = dim;
+    conf[knowhere::meta::RADIUS] = 10.0;
+    
+    // generate bitset view
+    knowhere::BitsetView bitset_view(bitmap, count);
+    auto res = knowhere::BruteForce::Search<knowhere::fp32>(base_dataset, query_dataset, conf, bitset_view);
+    
+    // Convert knowhere::Dataset to topKVector
+    // Note: This function is called from backend threads, so palloc is safe
+    topKVector* topk_result = (topKVector *) palloc(sizeof(topKVector));
+    
+    if (res.has_value()) {
+        const int64_t* ids = res.value()->GetIds();
+        const float* distances = res.value()->GetDistance();
+        int actual_k = Min(k, count);
+        
+        topk_result->num_results = actual_k;
+        topk_result->distances = (float *) palloc(sizeof(float) * actual_k);
+        topk_result->vids = (int64_t *) palloc(sizeof(int64_t) * actual_k);
+        
+        // Copy results
+        for (int i = 0; i < actual_k; i++) {
+            topk_result->distances[i] = distances[i];
+            topk_result->vids[i] = ids[i];
+        }
+    } else {
+        // Handle error case - return empty result
+        topk_result->num_results = 0;
+        topk_result->distances = nullptr;
+        topk_result->vids = nullptr;
+    }
+
+    // // TODO: for evaluation
+    // // Timing instrumentation - calculate and log execution time
+    // auto end_time = std::chrono::high_resolution_clock::now();
+    // auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+    
+    // // Static arrays to store last 1000 execution times
+    // int interval = 10000;
+    // static long execution_times[10000];
+    // static int call_count = 0;
+    // static int array_index = 0;
+    
+    // // Store current execution time
+    // execution_times[array_index] = duration.count();
+    // array_index = (array_index + 1) % interval;
+    // call_count++;
+    
+    // // Log statistics every 1000 calls
+    // if (call_count % interval == 0) {
+    //     long total_time = 0;
+    //     long min_time = LONG_MAX;
+    //     long max_time = 0;
+        
+    //     // Calculate stats for the last 1000 calls
+    //     for (int i = 0; i < interval; i++) {
+    //         total_time += execution_times[i];
+    //         if (execution_times[i] < min_time) min_time = execution_times[i];
+    //         if (execution_times[i] > max_time) max_time = execution_times[i];
+    //     }
+        
+    //     double avg_time = static_cast<double>(total_time) / (double)interval;
+    //     elog(DEBUG1, "[BruteForceSearch] Stats for last %d calls - Avg: %.2fμs, Min: %ldμs, Max: %ldμs", 
+    //          interval, avg_time, min_time, max_time);
+    // }
+    // // TODO: for evaluation (end here)
+    
+    return topk_result;
+}
+
+// merge index
+extern "C" void
+MergeIndex(void *index_ptr, uint8_t *bitmap_ptr, int count, IndexType old_index_type, IndexType new_index_type, void **new_index_ptr, int *new_index_count, int M, int efConstruction, int lists)
+{
+    elog(DEBUG1, "enter MergeIndex, index_ptr = %p, bitmap_ptr = %p, count = %d, old_index_type = %d, new_index_type = %d", 
+        index_ptr, bitmap_ptr, count, old_index_type, new_index_type);
+
+    auto *index = static_cast<knowhere::Index<knowhere::IndexNode>*>(index_ptr);
+
+    // Check if the index has raw data
+    if (!index->HasRawData(knowhere::metric::L2)) {
+        elog(ERROR, "MergeIndex: the index does not have raw data");
+        return;
+    }
+
+    // Get total number of vectors in the index
+    int total_count = index->Count();
+    if (total_count != count) {
+        elog(ERROR, "MergeIndex: the total number of vectors in the index does not match the count");
+        return;
+    }
+    
+    // Generate a bitmap view from the bitmap pointer
+    knowhere::BitsetView bitset_view(bitmap_ptr, count);
+    // TODO: for debugging
+    // int selected_count = count - bitset_view.count();
+    // count the number of bits in the bitmap (use bitmap_ptr)
+    int deleted_count = 0;
+    for (int i = 0; i < count; i++) {
+        if (IS_SLOT_SET(bitmap_ptr, i)) {
+            deleted_count++;
+        }
+    }
+    int selected_count = count - deleted_count;
+    if (selected_count <= 0) {
+        // TODO: handle this case
+        elog(ERROR, "MergeIndex: no vectors are selected");
+        return;
+    }
+    elog(DEBUG1, "MergeIndex: selected_count = %d", selected_count);
+
+    // Create an IDs dataset from the bitmap view
+    std::vector<int64_t> selected_ids;
+    selected_ids.reserve(selected_count);
+    for (int i = 0; i < count; i++) {
+        if (!bitset_view.test(i)) {
+            selected_ids.push_back(i);
+        }
+    }
+    int64_t actual_selected = (int64_t) selected_ids.size();
+    auto ids_dataset = knowhere::GenIdsDataSet(actual_selected, selected_ids.data());
+
+    // retrieve the selected vectors from the index
+    auto vectors_result = index->GetVectorByIds(ids_dataset);
+    if (!vectors_result.has_value()) {
+        elog(ERROR, "MergeIndex: failed to retrieve the selected vectors from the index");
+        return;
+    }
+    auto vectors = vectors_result.value();
+
+    // Create a new index
+    // initialize
+    auto version = knowhere::Version::GetCurrentVersion().VersionNumber();
+    knowhere::Index<knowhere::IndexNode> new_kindex;
+    switch (new_index_type)
+    {
+        case FLAT:
+            new_kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_FAISS_IDMAP, version).value();
+            break;
+        case HNSW:
+#if USE_GPU_CUVS
+            new_kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_CUVS_CAGRA, version).value();
+#else
+            new_kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version).value();
+#endif
+            break;
+        case IVFFLAT:
+#if USE_GPU_CUVS
+            new_kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_CUVS_IVFFLAT, version).value();
+#else
+            new_kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_FAISS_IVFFLAT, version).value();
+#endif
+            break;
+        default:
+            elog(ERROR, "MergeIndex: unsupported new index type %d", new_index_type);
+            return;
+    }
+    knowhere::Index<knowhere::IndexNode> * new_kindex_ptr = new knowhere::Index<knowhere::IndexNode>(new_kindex);
+
+    // configuration
+    knowhere::Json conf;
+    conf[knowhere::meta::ROWS] = selected_count;
+    conf[knowhere::meta::DIM] = index->Dim();
+    conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+    switch (new_index_type)
+    {
+        case FLAT:
+            break;
+        case IVFFLAT:
+            conf[knowhere::indexparam::NLIST] = lists;
+            break;
+        case HNSW:
+#if USE_GPU_CUVS
+            conf[knowhere::indexparam::GRAPH_DEGREE] = M;
+            conf[knowhere::indexparam::INTERMEDIATE_GRAPH_DEGREE] = efConstruction;
+#else
+            conf[knowhere::indexparam::M] = M;
+            conf[knowhere::indexparam::EFCONSTRUCTION] = efConstruction;
+#endif
+            break;
+    }
+
+    auto build_res = new_kindex_ptr->Build(vectors, conf);
+    Assert(build_res == knowhere::Status::success);
+    Assert(new_kindex_ptr->Count() == selected_count);
+
+    *new_index_ptr = static_cast<void*>(new_kindex_ptr);
+    *new_index_count = selected_count;
+}
+
+// Function to merge two built indices by inserting smaller index into larger one
+extern "C" void *
+MergeTwoIndices(void *lindex_ptr, int lcount, IndexType lindex_type,
+                void *sindex_ptr, int scount, IndexType sindex_type,
+                int *merged_count)
+{
+    elog(DEBUG1, "enter MergeTwoIndices, lindex_ptr = %p, lcount = %d, sindex_ptr = %p, scount = %d", 
+         lindex_ptr, lcount, sindex_ptr, scount);
+    
+    auto *lindex = static_cast<knowhere::Index<knowhere::IndexNode>*>(lindex_ptr);
+    auto *sindex = static_cast<knowhere::Index<knowhere::IndexNode>*>(sindex_ptr);
+
+    // Verify that index1 is the larger index
+    if (lcount < scount) {
+        elog(ERROR, "MergeTwoIndices: lindex count (%d) must be >= sindex count (%d)", lcount, scount);
+        return NULL;
+    }
+
+    // Check if both indices have raw data
+    elog(DEBUG1, "MergeTwoIndices: lindex_type = %d, sindex_type = %d", lindex_type, sindex_type);
+    if (!lindex->HasRawData(knowhere::metric::L2)) {
+        elog(ERROR, "MergeTwoIndices: lindex does not have raw data");
+        return NULL;
+    }
+    if (!sindex->HasRawData(knowhere::metric::L2)) {
+        elog(ERROR, "MergeTwoIndices: sindex does not have raw data");
+        return NULL;
+    }
+
+    // Validate counts match the actual index sizes
+    int index1_actual_count = lindex->Count();
+    int index2_actual_count = sindex->Count();
+    if (index1_actual_count != lcount) {
+        elog(ERROR, "MergeTwoIndices: lindex count (%d) does not match lcount (%d)", index1_actual_count, lcount);
+        return NULL;
+    }
+    if (index2_actual_count != scount) {
+        elog(ERROR, "MergeTwoIndices: sindex count (%d) does not match scount (%d)", index2_actual_count, scount);
+        return NULL;
+    }
+
+    // Check dimension consistency
+    if (lindex->Dim() != sindex->Dim()) {
+        elog(ERROR, "MergeTwoIndices: dimension mismatch - lindex: %ld, sindex: %ld", (long)lindex->Dim(), (long)sindex->Dim());
+        return NULL;
+    }
+    int dim = lindex->Dim();
+
+    elog(DEBUG1, "MergeTwoIndices: larger_count = %d, smaller_count = %d", lcount, scount);
+
+    // Get all vectors from the smaller index (index2)
+    {
+        std::vector<int64_t> all_ids(scount);
+        for (int64_t i = 0; i < scount; ++i) all_ids[i] = i;
+        auto id_ds = knowhere::GenIdsDataSet(scount, all_ids.data());
+        auto smaller_vectors_result = sindex->GetVectorByIds(id_ds);
+        if (!smaller_vectors_result.has_value()) {
+            elog(ERROR, "MergeTwoIndices: failed to retrieve vectors from smaller index");
+            return NULL;
+        }
+        auto smaller_dataset = smaller_vectors_result.value();
+
+        // Insert vectors from smaller index into larger index
+        knowhere::Json add_conf;
+        add_conf[knowhere::meta::ROWS] = scount;
+        add_conf[knowhere::meta::DIM] = dim;
+        add_conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+
+        auto add_res = lindex->Add(smaller_dataset, add_conf);
+
+        if (add_res != knowhere::Status::success) {
+            elog(ERROR, "MergeTwoIndices: failed to add vectors from smaller index to larger index");
+            return NULL;
+        }
+    }
+
+    // Verify the merged index count
+    int merged_count_check = lindex->Count();
+    int expected_count = lcount + scount;
+    if (merged_count_check != expected_count) {
+        elog(ERROR, "MergeTwoIndices: merged index count (%d) does not match expected (%d)", 
+             merged_count_check, expected_count);
+        return NULL;
+    }
+
+    elog(DEBUG1, "MergeTwoIndices: merged_count = %d", merged_count_check);
+
+    // Return the merged count
+    *merged_count = merged_count_check;
+    return lindex;
+}
+
+// Note: SegmentSearchInfo is defined in vectorindeximpl.hpp
+
+// C++ version of merge_top_k (same logic as the C version)
+static int
+merge_top_k_cpp(DistancePair *pairs_1, DistancePair *pairs_2, int num_1, int num_2, int top_k, DistancePair *merge_pair)
+{
+    int i = 0, j = 0, k = 0;
+
+    while (k < top_k && (i < num_1 || j < num_2)) {
+        if (i < num_1 && (j >= num_2 || pairs_1[i].distance <= pairs_2[j].distance)) {
+            merge_pair[k++] = pairs_1[i++];
+        } else if (j < num_2) {
+            merge_pair[k++] = pairs_2[j++];
+        }
+    }
+
+    return k;
+}
+
+struct SegmentResult {
+    topKVector* topk_vectors;
+    DistancePair* pairs;
+    int pair_count;
+    bool searched;  // true if this segment was searched (not skipped)
+};
+
+// Structure to hold search results from all segments
+struct ConcurrentSearchContext {
+    // Input parameters
+    const float* query_vector;
+    int topk;
+    int efs_nprobe;
+    uint32_t segment_count;
+    SegmentSearchInfo* segments;
+    
+    // Results storage (one per segment)
+    struct SegmentResult *segment_results;
+    
+    // Atomic countdown for last-finisher continuation
+    std::atomic<int> remaining_count;
+    
+    // Final merged result storage
+    DistancePair* final_pairs;
+    int final_count;
+    
+    // Result structure to write final results to
+    struct ResultInfo {
+        VectorSearchResult result;
+        PGPROC* client_proc;
+    } *result_info;
+    
+    // Pool pointer for decrementing reference counts
+    FlushedSegmentPool* pool_ptr;
+};
+
+// Helper function to merge all segment results
+static void
+merge_all_segment_results(ConcurrentSearchContext* ctx) {
+    // Find the first non-empty result
+    DistancePair* merged_pairs = nullptr;
+    int merged_count = 0;
+    bool first_result = true;
+    
+    for (uint32_t i = 0; i < ctx->segment_count; i++) {
+        if (!ctx->segment_results[i].searched || ctx->segment_results[i].pair_count == 0) {
+            continue;
+        }
+        
+        if (first_result) {
+            // First result - allocate new memory and copy (we'll free all segment results later)
+            merged_pairs = (DistancePair*) malloc(sizeof(DistancePair) * ctx->topk);
+            merged_count = ctx->segment_results[i].pair_count;
+            // Copy the first result
+            for (int j = 0; j < merged_count; j++) {
+                merged_pairs[j] = ctx->segment_results[i].pairs[j];
+            }
+            first_result = false;
+        } else {
+            // Merge with existing results
+            DistancePair* new_merged = (DistancePair*) malloc(sizeof(DistancePair) * ctx->topk);
+            merged_count = merge_top_k_cpp(merged_pairs, ctx->segment_results[i].pairs, 
+                                      merged_count, ctx->segment_results[i].pair_count, 
+                                      ctx->topk, new_merged);
+            
+            // Free old merged result
+            free(merged_pairs);
+            merged_pairs = new_merged;
+        }
+    }
+    
+    ctx->final_pairs = merged_pairs;
+    ctx->final_count = (merged_pairs != nullptr) ? merged_count : 0;
+    
+    // Free all segment result pairs (they've been merged into final_pairs)
+    for (uint32_t i = 0; i < ctx->segment_count; i++) {
+        if (ctx->segment_results[i].pairs != nullptr) {
+            free(ctx->segment_results[i].pairs);
+            ctx->segment_results[i].pairs = nullptr;
+        }
+    }
+}
+
+// Function called by each thread to search a segment
+static void
+search_segment_task(ConcurrentSearchContext* ctx, uint32_t seg_idx) {
+    SegmentSearchInfo* seg = &ctx->segments[seg_idx];
+    SegmentResult* result = &ctx->segment_results[seg_idx];
+    
+    // Perform the search
+    result->topk_vectors = VectorIndexSearch(seg->index_type, seg->index_ptr, seg->bitmap_ptr,
+                                      seg->vec_count, ctx->query_vector, 
+                                      ctx->topk, ctx->efs_nprobe);
+
+    if (result->topk_vectors != nullptr && result->topk_vectors->num_results > 0) {
+        result->searched = true;
+        result->pair_count = result->topk_vectors->num_results;
+        result->pairs = (DistancePair*) malloc(sizeof(DistancePair) * result->pair_count);
+        
+        // Convert result to DistancePair format
+        for (int k = 0; k < result->pair_count; k++) {
+            result->pairs[k].distance = result->topk_vectors->distances[k];
+            int pos = result->topk_vectors->vids[k];
+            result->pairs[k].id = seg->map_ptr[pos];
+        }
+        
+        // Free topk_vectors (always needed)
+        // Use malloc version since VectorIndexSearchImpl uses malloc for thread-safety
+        free_topk_vector_malloc(result->topk_vectors);
+        result->topk_vectors = nullptr;
+    } else {
+        result->searched = true;
+        result->pair_count = 0;
+        result->pairs = nullptr;
+        if (result->topk_vectors != nullptr) {
+            // Use malloc version since VectorIndexSearchImpl uses malloc for thread-safety
+            free_topk_vector_malloc(result->topk_vectors);
+            result->topk_vectors = nullptr;
+        }
+    }
+
+    // Decrement reference count for this segment immediately after search completes
+    // This allows the segment to be freed/cleaned up earlier if needed
+    if (ctx->pool_ptr) {
+        decrement_flushed_segment_ref_count(ctx->pool_ptr, seg->segment_idx);
+    }
+    
+    // Atomic countdown: decrement and check if we're the last one
+    int remaining = ctx->remaining_count.fetch_sub(1) - 1;
+    if (remaining == 0) {
+        // We are the last thread to finish - merge results, write to result structure, and set latch
+        merge_all_segment_results(ctx);
+        // Write results to the result structure
+        if (ctx->result_info && ctx->result_info->result) {
+            VectorSearchResult result = ctx->result_info->result;
+            result->result_count = ctx->final_count;
+            
+            float* res_dist = vs_search_result_dist_at(result);
+            int64_t* res_id = vs_search_result_id_at(result);
+
+
+            for (int i = 0; i < ctx->final_count; i++) {
+                res_dist[i] = ctx->final_pairs[i].distance;
+                res_id[i] = ctx->final_pairs[i].id;
+            }
+        }
+        
+        // Set latch to notify the client backend
+        if (ctx->result_info && ctx->result_info->client_proc) {
+            SetLatch(&ctx->result_info->client_proc->procLatch);
+        }
+        // Free the context and all its sub-structures (allocated with malloc)
+        if (ctx->final_pairs) {
+            free(ctx->final_pairs);
+        }
+        if (ctx->segment_results) {
+            free(ctx->segment_results);
+        }
+        if (ctx->result_info) {
+            free(ctx->result_info);
+        }
+        if (ctx->segments) {
+            free(ctx->segments);
+        }
+        free(ctx);
+    }
+}
+
+// Global singleton executor for outer search fan-out
+// This is separate from Knowhere's internal thread pool to avoid conflicts
+static folly::CPUThreadPoolExecutor& GetPgOuterSearchExecutor() {
+    static folly::CPUThreadPoolExecutor exec(
+        /*numThreads=*/std::max(1u, std::thread::hardware_concurrency() / 2),
+        std::make_shared<folly::NamedThreadFactory>("pg_outer_search")
+    );
+    return exec;
+}
+
+// C wrapper function for concurrent vector search
+extern "C" void
+ConcurrentVectorSearchOnSegments(
+    SegmentSearchInfo* segments,
+    uint32_t segment_count,
+    const float* query_vector,
+    int topk,
+    int efs_nprobe,
+    VectorSearchResult result,
+    PGPROC* client_proc,    
+    FlushedSegmentPool* pool) {
+    // Get the dedicated outer search executor (separate from Knowhere's internal pool)
+    auto& exec = GetPgOuterSearchExecutor();
+
+    // Allocate context structure using malloc (thread-safe allocation)
+    ConcurrentSearchContext* ctx = (ConcurrentSearchContext*) 
+        malloc(sizeof(ConcurrentSearchContext));
+    
+    ctx->query_vector = query_vector;
+    ctx->topk = topk;
+    ctx->efs_nprobe = efs_nprobe;
+    ctx->segment_count = segment_count;
+    ctx->segments = segments;
+    ctx->pool_ptr = pool;
+    ctx->final_pairs = nullptr;
+    ctx->final_count = 0;
+    
+    // Allocate result info structure
+    ctx->result_info = (ConcurrentSearchContext::ResultInfo*)
+        malloc(sizeof(ConcurrentSearchContext::ResultInfo));
+    ctx->result_info->result = result;
+    ctx->result_info->client_proc = client_proc;
+    
+    // Initialize atomic counter
+    ctx->remaining_count.store(segment_count);
+    
+    // Allocate result storage
+    ctx->segment_results = (SegmentResult*)
+        malloc(sizeof(SegmentResult) * segment_count);
+
+    // Initialize results
+    for (uint32_t i = 0; i < segment_count; i++) {
+        ctx->segment_results[i].topk_vectors = nullptr;
+        ctx->segment_results[i].pairs = nullptr;
+        ctx->segment_results[i].pair_count = 0;
+        ctx->segment_results[i].searched = false;
+    }
+
+    // Launch concurrent searches on all segments using the dedicated outer executor
+    // Each task will run asynchronously in the executor
+    // The last-finisher thread will handle merging, writing results, and setting the latch
+    for (uint32_t i = 0; i < segment_count; i++) {
+        exec.add([ctx, i]() {
+            // knowhere::ThreadPool::ScopedSearchOmpSetter setter(1);  // Set OMP threads to 1 per task
+            search_segment_task(ctx, i);
+        });
+    }
+    
+    // Return immediately - all work (search, merge, notification) is handled asynchronously
+    // by threads in the thread pool. The context is allocated in memctx which persists
+    // until all tasks complete.
+}
+
+/* -------------------------------------------------------------------------
+ * GPU batch search path (USE_GPU_CUVS only)
+ *
+ * For each SegmentQueryBatch we submit one Folly task that calls
+ *   knowhere::Search(GenDataSet(m, dim, packed_vectors), conf, nullptr)
+ * with m = number of queries needing that segment.  Results are distributed
+ * back to per-query atomic countdown state; when a query's last segment
+ * finishes, its results are merged and its backend latch is set.
+ * -------------------------------------------------------------------------
+ */
+#if USE_GPU_CUVS
+
+/* Per-query async state.  One instance per query in the batch, freed by the
+ * Folly thread that decrements pending_segments to zero. */
+struct BatchQueryState {
+    int                  topk;
+    int                  efs_nprobe;
+    VectorSearchResult   result_slot;
+    PGPROC              *client_proc;
+    int                  n_segments;            /* total segments this query searches */
+    std::atomic<int>     pending_segments;      /* countdown; 0 → finalize */
+    DistancePair       **seg_results;           /* [n_segments], each malloc'd or NULL */
+    int                 *seg_result_counts;     /* [n_segments] */
+};
+
+/* Context owned by one Folly segment task (one segment × m queries). */
+struct SegBatchTaskCtx {
+    SegmentSearchInfo    segment;           /* copy of segment metadata */
+    uint32_t             pool_seg_idx;      /* for ref-count decrement */
+    FlushedSegmentPool  *pool;
+    int                  n_queries;
+    int                  dim;
+    int                  max_topk;          /* max topk across queries in this batch */
+    int                  max_efs;           /* max efs_nprobe across queries in this batch */
+    float               *packed_vectors;    /* n_queries * dim floats, malloc'd */
+    BatchQueryState    **query_states;      /* n_queries ptrs, malloc'd */
+    int                 *query_seg_slots;   /* which slot in each query's seg_results[], malloc'd */
+};
+
+/* Merge all per-segment results for one query, write to its shmem result slot,
+ * set its backend latch, then free all per-query state. */
+static void
+finalize_batch_query(BatchQueryState *qs)
+{
+    DistancePair *merged = nullptr;
+    int           merged_count = 0;
+    bool          first = true;
+
+    for (int i = 0; i < qs->n_segments; i++) {
+        if (qs->seg_result_counts[i] == 0 || qs->seg_results[i] == nullptr)
+            continue;
+
+        if (first) {
+            merged = (DistancePair *)malloc(sizeof(DistancePair) * qs->topk);
+            merged_count = std::min(qs->seg_result_counts[i], qs->topk);
+            memcpy(merged, qs->seg_results[i], sizeof(DistancePair) * merged_count);
+            first = false;
+        } else {
+            DistancePair *new_merged = (DistancePair *)malloc(sizeof(DistancePair) * qs->topk);
+            merged_count = merge_top_k_cpp(merged, qs->seg_results[i],
+                                           merged_count, qs->seg_result_counts[i],
+                                           qs->topk, new_merged);
+            free(merged);
+            merged = new_merged;
+        }
+    }
+
+    /* Write to shmem result slot */
+    VectorSearchResult result = qs->result_slot;
+    result->result_count = merged_count;
+    if (merged_count > 0) {
+        float   *res_dist = vs_search_result_dist_at(result);
+        int64_t *res_id   = vs_search_result_id_at(result);
+        for (int i = 0; i < merged_count; i++) {
+            res_dist[i] = merged[i].distance;
+            res_id[i]   = merged[i].id;
+        }
+    }
+    if (merged)
+        free(merged);
+
+    /* Wake the backend */
+    SetLatch(&qs->client_proc->procLatch);
+
+    /* Free per-segment result arrays */
+    for (int i = 0; i < qs->n_segments; i++) {
+        if (qs->seg_results[i])
+            free(qs->seg_results[i]);
+    }
+    free(qs->seg_results);
+    free(qs->seg_result_counts);
+    free(qs);
+}
+
+/* Folly task: search one segment for a batch of m queries at once. */
+static void
+batch_search_segment_task(SegBatchTaskCtx *ctx)
+{
+    int nq   = ctx->n_queries;
+    int topk = ctx->max_topk;
+    int dim  = ctx->dim;
+    int efs  = ctx->max_efs;
+
+    knowhere::Index<knowhere::IndexNode> *index =
+        static_cast<knowhere::Index<knowhere::IndexNode> *>(ctx->segment.index_ptr);
+
+    /* Build search config (same as VectorIndexSearchImpl but for CUVS types only) */
+    knowhere::Json conf;
+    conf[knowhere::meta::TOPK]        = topk;
+    conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+    conf[knowhere::meta::DIM]         = (int64_t)dim;
+    switch (ctx->segment.index_type) {
+        case HNSW:
+            conf[knowhere::indexparam::ITOPK_SIZE] = efs;
+            conf[knowhere::indexparam::SEARCH_ALGO] = "MULTI_CTA";
+            break;
+        case IVFFLAT:
+            conf[knowhere::indexparam::NPROBE] = efs;
+            break;
+        default:
+            break;
+    }
+
+    /* Single batched GPU search: nq query vectors in one GenDataSet call */
+    auto dataset = knowhere::GenDataSet(nq, dim, ctx->packed_vectors);
+    knowhere::BitsetView bitset_view(nullptr);
+    auto res = index->Search(dataset, conf, bitset_view);
+
+    const int64_t *ids   = (res.has_value() && res.value()) ? res.value()->GetIds()      : nullptr;
+    const float   *dists = (res.has_value() && res.value()) ? res.value()->GetDistance() : nullptr;
+
+    /* Distribute per-query results from the flattened [nq * topk] output */
+    for (int qi = 0; qi < nq; qi++) {
+        BatchQueryState *qs   = ctx->query_states[qi];
+        int              slot = ctx->query_seg_slots[qi];
+
+        if (ids != nullptr) {
+            const int64_t *q_ids   = ids   + (size_t)qi * topk;
+            const float   *q_dists = dists + (size_t)qi * topk;
+
+            /* Count valid results; Knowhere uses -1 as sentinel for padding */
+            int valid = 0;
+            for (int j = 0; j < topk; j++) {
+                if (q_ids[j] < 0) break;
+                valid++;
+            }
+
+            if (valid > 0) {
+                DistancePair *pairs = (DistancePair *)malloc(sizeof(DistancePair) * valid);
+                for (int j = 0; j < valid; j++) {
+                    pairs[j].distance = q_dists[j];
+                    pairs[j].id       = ctx->segment.map_ptr[(int)q_ids[j]]; /* segment-local → global TID */
+                }
+                qs->seg_results[slot]       = pairs;
+                qs->seg_result_counts[slot] = valid;
+            } else {
+                qs->seg_results[slot]       = nullptr;
+                qs->seg_result_counts[slot] = 0;
+            }
+        } else {
+            qs->seg_results[slot]       = nullptr;
+            qs->seg_result_counts[slot] = 0;
+        }
+
+        /* Per-query countdown: last segment to finish triggers merge + notify */
+        int remaining = qs->pending_segments.fetch_sub(1) - 1;
+        if (remaining == 0)
+            finalize_batch_query(qs);
+    }
+
+    /* One ref-count decrement per segment (matched by one increment in batch_vector_search) */
+    decrement_flushed_segment_ref_count(ctx->pool, ctx->pool_seg_idx);
+
+    free(ctx->packed_vectors);
+    free(ctx->query_states);
+    free(ctx->query_seg_slots);
+    free(ctx);
+}
+
+extern "C" void
+BatchedConcurrentVectorSearchOnSegments(
+    BatchQueryDescriptor *queries,
+    int                   nq,
+    SegmentQueryBatch    *seg_batches,
+    int                   n_seg_batches,
+    FlushedSegmentPool   *pool)
+{
+    auto &exec = GetPgOuterSearchExecutor();
+
+    /* Count how many segments each query appears in across all segment batches */
+    int *query_seg_count = (int *)calloc(nq, sizeof(int));
+    for (int si = 0; si < n_seg_batches; si++) {
+        SegmentQueryBatch *sb = &seg_batches[si];
+        for (int qi = 0; qi < sb->n_queries; qi++)
+            query_seg_count[sb->query_indices[qi]]++;
+    }
+
+    /* Allocate per-query state */
+    BatchQueryState **states = (BatchQueryState **)malloc(sizeof(BatchQueryState *) * nq);
+    for (int i = 0; i < nq; i++) {
+        BatchQueryState *qs = (BatchQueryState *)malloc(sizeof(BatchQueryState));
+        qs->topk              = queries[i].topk;
+        qs->efs_nprobe        = queries[i].efs_nprobe;
+        qs->result_slot       = queries[i].result_slot;
+        qs->client_proc       = queries[i].client_proc;
+        qs->n_segments        = query_seg_count[i];
+        qs->pending_segments.store(query_seg_count[i]);
+        qs->seg_results       = (DistancePair **)calloc(query_seg_count[i], sizeof(DistancePair *));
+        qs->seg_result_counts = (int *)calloc(query_seg_count[i], sizeof(int));
+        states[i] = qs;
+    }
+    free(query_seg_count);
+
+    /* slot cursor: tracks the next free slot in each query's seg_results[] */
+    int *slot_cursor = (int *)calloc(nq, sizeof(int));
+
+    /* Build and submit one Folly task per segment batch */
+    for (int si = 0; si < n_seg_batches; si++) {
+        SegmentQueryBatch *sb = &seg_batches[si];
+        int m = sb->n_queries;
+
+        if (m == 0) {
+            decrement_flushed_segment_ref_count(pool, sb->pool_seg_idx);
+            free(sb->query_indices);
+            continue;
+        }
+
+        int max_topk = 0, max_efs = 0;
+        for (int qi = 0; qi < m; qi++) {
+            int idx = sb->query_indices[qi];
+            if (queries[idx].topk       > max_topk) max_topk = queries[idx].topk;
+            if (queries[idx].efs_nprobe > max_efs)  max_efs  = queries[idx].efs_nprobe;
+        }
+        int dim = queries[sb->query_indices[0]].dim;
+
+        SegBatchTaskCtx *ctx       = (SegBatchTaskCtx *)malloc(sizeof(SegBatchTaskCtx));
+        ctx->segment               = sb->segment;
+        ctx->pool_seg_idx          = sb->pool_seg_idx;
+        ctx->pool                  = pool;
+        ctx->n_queries             = m;
+        ctx->dim                   = dim;
+        ctx->max_topk              = max_topk;
+        ctx->max_efs               = max_efs;
+        ctx->packed_vectors        = (float *)malloc(sizeof(float) * (size_t)m * dim);
+        ctx->query_states          = (BatchQueryState **)malloc(sizeof(BatchQueryState *) * m);
+        ctx->query_seg_slots       = (int *)malloc(sizeof(int) * m);
+
+        /* Pack query vectors and record per-query segment slot assignments */
+        for (int qi = 0; qi < m; qi++) {
+            int idx = sb->query_indices[qi];
+            memcpy(ctx->packed_vectors + (size_t)qi * dim,
+                   queries[idx].query_vector,
+                   sizeof(float) * dim);
+            ctx->query_states[qi]    = states[idx];
+            ctx->query_seg_slots[qi] = slot_cursor[idx]++;
+        }
+
+        /* query_indices was malloc'd by the C caller; free it now that we've consumed it */
+        free(sb->query_indices);
+
+        exec.add([ctx]() { batch_search_segment_task(ctx); });
+    }
+
+    free(slot_cursor);
+    free(states); /* individual BatchQueryState structs are freed by finalize_batch_query */
+}
+
+#endif /* USE_GPU_CUVS */

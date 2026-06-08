@@ -21,6 +21,11 @@
 #include "utils/lsyscache.h"
 #include "utils/numeric.h"
 #include "vector.h"
+#include "storage/ipc.h"
+
+#include "vector_index_worker.h"
+#include "lsmindex.h"
+#include "lsm_merge_worker.h"
 
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"
@@ -41,6 +46,23 @@ PG_MODULE_MAGIC_EXT(.name = "vector",.version = "0.8.0");
 PG_MODULE_MAGIC;
 #endif
 
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+
+static void
+shmem_startup(void)
+{
+	elog(DEBUG1, "enter shmem_startup");
+    if (prev_shmem_startup_hook)
+        prev_shmem_startup_hook();
+
+	ring_buffer_init();
+	vector_index_worker_init();
+	lsm_index_buffer_shmem_initialize();
+	
+	// initialize merge worker manager
+	initialize_merge_worker_manager();
+}
+
 /*
  * Initialize index options and variables
  */
@@ -52,6 +74,98 @@ _PG_init(void)
 	HalfvecInit();
 	HnswInit();
 	IvfflatInit();
+
+	// reserve LWLock tranche for vector search ring buffer
+	RequestNamedLWLockTranche(VECTOR_SEARCH_RING_TRANCHE, 1);
+	LWLockRegisterTranche(VECTOR_SEARCH_RING_TRANCHE_ID, VECTOR_SEARCH_RING_TRANCHE);
+	RequestNamedLWLockTranche(LSM_MEMTABLE_LWTRANCHE, INDEX_BUF_SIZE);
+	LWLockRegisterTranche(LSM_MEMTABLE_LWTRANCHE_ID, LSM_MEMTABLE_LWTRANCHE);
+	RequestNamedLWLockTranche(LSM_SEGMENT_LWTRANCHE, INDEX_BUF_SIZE);
+	LWLockRegisterTranche(LSM_SEGMENT_LWTRANCHE_ID, LSM_SEGMENT_LWTRANCHE);
+	
+	// reserve LWLock tranche for merge worker manager (need multiple locks for segment arrays)
+	RequestNamedLWLockTranche("LSM Merge Worker", INDEX_BUF_SIZE + 1); // +1 for main manager lock
+	LWLockRegisterTranche(1003, "LSM Merge Worker");
+	
+	// reserve LWLock tranche for merge segment bitmap locks
+	// Need INDEX_BUF_SIZE * MAX_SEGMENTS_COUNT locks (one per segment per index buffer slot)
+	RequestNamedLWLockTranche(LSM_MERGE_SEGMENT_BITMAP_LWTRANCHE, INDEX_BUF_SIZE * MAX_SEGMENTS_COUNT);
+	LWLockRegisterTranche(LSM_MERGE_SEGMENT_BITMAP_LWTRANCHE_ID, LSM_MERGE_SEGMENT_BITMAP_LWTRANCHE);
+	
+	// reserve LWLock tranche for memtable vacuum locks
+	// Need MEMTABLE_BUF_SIZE locks (one per memtable slot)
+	RequestNamedLWLockTranche(LSM_MEMTABLE_VACUUM_LWTRANCHE, MEMTABLE_BUF_SIZE);
+	LWLockRegisterTranche(LSM_MEMTABLE_VACUUM_LWTRANCHE_ID, LSM_MEMTABLE_VACUUM_LWTRANCHE);
+	
+	// reserve LWLock tranche for flushed release locks
+	// Need INDEX_BUF_SIZE locks (one per index slot)
+	RequestNamedLWLockTranche(LSM_FLUSHED_RELEASE_LWTRANCHE, INDEX_BUF_SIZE);
+	LWLockRegisterTranche(LSM_FLUSHED_RELEASE_LWTRANCHE_ID, LSM_FLUSHED_RELEASE_LWTRANCHE);
+	
+	// reserve LWLock tranche for LSM index buffer lock
+	RequestNamedLWLockTranche(LSM_INDEX_BUFFER_LWTRANCHE, 1);
+	LWLockRegisterTranche(LSM_INDEX_BUFFER_LWTRANCHE_ID, LSM_INDEX_BUFFER_LWTRANCHE);
+
+	// reserve shared memory for ring buffer
+	RequestAddinShmemSpace(calculate_ring_buffer_shmem_size());
+
+	// TODO: confirm the size of the shared memory structure
+	// initialize a shared memory structure
+	RequestAddinShmemSpace(4000000000L); // 2GB
+	
+	// reserve shared memory for merge worker manager
+	RequestAddinShmemSpace(sizeof(MergeWorkerManager));
+	prev_shmem_startup_hook = shmem_startup_hook;
+    shmem_startup_hook = shmem_startup;
+	
+	// initialize and register the vector index search process
+	elog(DEBUG1, "[_PG_init]register vector index worker");
+	BackgroundWorker vector_index_worker;
+	memset(&vector_index_worker, 0, sizeof(BackgroundWorker));
+	vector_index_worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
+	vector_index_worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	vector_index_worker.bgw_restart_time = 1;
+	snprintf(vector_index_worker.bgw_name, BGW_MAXLEN, "VectorIndexWorker"); // name
+	snprintf(vector_index_worker.bgw_library_name, BGW_MAXLEN, "vector.so"); // no .so
+	snprintf(vector_index_worker.bgw_function_name, BGW_MAXLEN, "vector_index_worker_main"); // entry function
+	vector_index_worker.bgw_main_arg = (Datum) 0;
+	vector_index_worker.bgw_notify_pid = 0;
+	RegisterBackgroundWorker(&vector_index_worker);
+	elog(DEBUG1, "[_PG_init]register vector index worker finished");
+
+	// initialize and register the lsm index background worker
+	elog(DEBUG1, "[_PG_init]register lsm index worker");
+	BackgroundWorker lsm_index_worker;
+	memset(&lsm_index_worker, 0, sizeof(BackgroundWorker));
+	lsm_index_worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
+	lsm_index_worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	lsm_index_worker.bgw_restart_time = 1;
+	snprintf(lsm_index_worker.bgw_name, BGW_MAXLEN, "LSMBackgroundWorker"); // name
+	snprintf(lsm_index_worker.bgw_library_name, BGW_MAXLEN, "vector.so"); // no .so
+	snprintf(lsm_index_worker.bgw_function_name, BGW_MAXLEN, "lsm_index_bgworker_main"); // entry function
+	lsm_index_worker.bgw_main_arg = (Datum) 0;
+	lsm_index_worker.bgw_notify_pid = 0;
+	RegisterBackgroundWorker(&lsm_index_worker);
+	elog(DEBUG1, "[_PG_init]register lsm index worker finished");
+
+	// initialize and register multiple lsm merge workers
+	elog(DEBUG1, "[_PG_init]register lsm merge workers");
+	for (int i = 0; i < MERGE_WORKERS_COUNT; i++)
+	{
+		BackgroundWorker lsm_merge_worker;
+		memset(&lsm_merge_worker, 0, sizeof(BackgroundWorker));
+		lsm_merge_worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
+		lsm_merge_worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+		lsm_merge_worker.bgw_restart_time = 1;
+		snprintf(lsm_merge_worker.bgw_name, BGW_MAXLEN, "LSMMergeWorker%d", i); // unique name per worker
+		snprintf(lsm_merge_worker.bgw_library_name, BGW_MAXLEN, "vector.so"); // no .so
+		snprintf(lsm_merge_worker.bgw_function_name, BGW_MAXLEN, "lsm_merge_worker_main"); // entry function
+		lsm_merge_worker.bgw_main_arg = (Datum) i; // Worker ID (0, 1, 2, ...)
+		lsm_merge_worker.bgw_notify_pid = 0;
+		RegisterBackgroundWorker(&lsm_merge_worker);
+		elog(DEBUG1, "[_PG_init]registered lsm merge worker %d", i);
+	}
+	elog(DEBUG1, "[_PG_init]register lsm merge workers finished (total: %d)", MERGE_WORKERS_COUNT);
 }
 
 /*

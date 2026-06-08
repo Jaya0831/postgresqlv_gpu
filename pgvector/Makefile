@@ -4,7 +4,8 @@ EXTVERSION = 0.8.0
 MODULE_big = vector
 DATA = $(wildcard sql/*--*--*.sql)
 DATA_built = sql/$(EXTENSION)--$(EXTVERSION).sql
-OBJS = src/bitutils.o src/bitvec.o src/halfutils.o src/halfvec.o src/hnsw.o src/hnswbuild.o src/hnswinsert.o src/hnswscan.o src/hnswutils.o src/hnswvacuum.o src/ivfbuild.o src/ivfflat.o src/ivfinsert.o src/ivfkmeans.o src/ivfscan.o src/ivfutils.o src/ivfvacuum.o src/sparsevec.o src/vector.o
+OBJS = src/bitutils.o src/bitvec.o src/halfutils.o src/halfvec.o src/hnsw.o src/hnswbuild.o src/hnswinsert.o src/hnswscan.o src/hnswutils.o src/hnswvacuum.o src/ivfbuild.o src/ivfflat.o src/ivfinsert.o src/ivfkmeans.o src/ivfscan.o src/ivfutils.o src/ivfvacuum.o src/sparsevec.o src/vector.o \
+	   src/lsmindex.o src/lsm_segment.o src/lsmbackground.o src/lsmindex_io.o src/ringbuffer.o src/tasksend.o src/vector_index_worker.o src/vectorindeximpl.o src/utils.o src/lsm_merge_worker.o src/folly_f14_link_alias.o src/statuspage.o
 HEADERS = src/halfvec.h src/sparsevec.h src/vector.h
 
 TESTS = $(wildcard test/sql/*.sql)
@@ -38,12 +39,58 @@ PG_CFLAGS += $(OPTFLAGS) -ftree-vectorize -fassociative-math -fno-signed-zeros -
 # Debug Clang auto-vectorization
 # PG_CFLAGS += -Rpass=loop-vectorize -Rpass-analysis=loop-vectorize
 
+CXX = g++
+
+# knowhere
+KNOWHERE_LIBS := -L/home/ptandra/ssd/knowhere/build/Release -lknowhere -lknowhere_utils /home/ptandra/ssd/knowhere/build/Release/libfaiss.a
+
+# Folly and nlohmann from Conan (your path)
+NLOHMANN_INC := -I/home/ptandra/.conan/data/nlohmann_json/3.11.2/_/_/package/5ab84d6acfe1f23c4fae0ab88f26e3a396351ac9/include
+FOLLY_BASE   := /home/ptandra/.conan/data/folly/2023.10.30.09/milvus/dev/package/763c5ce8d7ce4bf601cff416efb08f89b95b9205
+FOLLY_INC    := -I$(FOLLY_BASE)/include
+FOLLY_LIBDIR := $(FOLLY_BASE)/lib
+FOLLY_LIB    := -L$(FOLLY_LIBDIR) -lfolly
+
+# glog from Conan
+GLOG_BASE   := /home/ptandra/.conan/data/glog/0.6.0/_/_/package/dd3c9e0dd79522c7df25a63d555c80dfef332d06
+GLOG_INC    := -I$(GLOG_BASE)/include
+GLOG_LIBDIR := $(GLOG_BASE)/lib
+GLOG_LIB    := -L$(GLOG_LIBDIR) -lglog
+
+# double-conversion (Folly dependency)
+DOUBLE_CONVERSION_BASE := /home/ptandra/.conan/data/double-conversion/3.2.1/_/_/package/6557f18ca99c0b6a233f43db00e30efaa525e27e
+DOUBLE_CONVERSION_INC  := -I$(DOUBLE_CONVERSION_BASE)/include
+DOUBLE_CONVERSION_LIB  := -L$(DOUBLE_CONVERSION_BASE)/lib -ldouble-conversion
+
+# fmt (Folly dependency)
+FMT_BASE := /home/ptandra/.conan/data/fmt/9.1.0/_/_/package/5ab84d6acfe1f23c4fae0ab88f26e3a396351ac9
+FMT_INC  := -I$(FMT_BASE)/include
+
+CXXFLAGS += -std=c++17 $(OPTFLAGS) -O3 -Ofast -march=native -fopenmp \
+			-ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math
+
+CPPFLAGS += $(GLOG_INC)
+
+PG_CPPFLAGS += -I$(shell $(PG_CONFIG) --includedir-server)
+PG_CPPFLAGS += -I$(shell $(PG_CONFIG) --includedir)/internal
+PG_CPPFLAGS += $(NLOHMANN_INC) $(FOLLY_INC) $(GLOG_INC) $(FMT_INC)
+# PG_CPPFLAGS += -I/usr/local/include
+PG_CPPFLAGS += -I/home/ptandra/ssd/knowhere/include -I/home/ptandra/ssd/knowhere/src -I/home/ptandra/ssd/knowhere/thirdparty
+PG_CPPFLAGS += -DGLOG_NO_ABBREVIATED_SEVERITIES
+SHLIB_LINK += $(KNOWHERE_LIBS) $(FOLLY_LIB) $(GLOG_LIB) \
+              -L/usr/local/lib -L/usr/lib/x86_64-linux-gnu -lgflags -lpthread -lstdc++ -lc -lblas -fopenmp \
+              -Wl,-rpath,/home/ptandra/ssd/knowhere/build/Release -Wl,-rpath,$(GLOG_LIBDIR)
+
+
+%.o: %.cpp
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -fPIC -c $< -o $@
+
 all: sql/$(EXTENSION)--$(EXTVERSION).sql
 
 sql/$(EXTENSION)--$(EXTVERSION).sql: sql/$(EXTENSION).sql
 	cp $< $@
 
-PG_CONFIG ?= pg_config
+PG_CONFIG = /ssd_root/ptandra/pg_install/bin/pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 

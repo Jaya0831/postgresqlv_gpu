@@ -12,6 +12,7 @@
 #include "utils/sampling.h"
 #include "utils/tuplesort.h"
 #include "vector.h"
+#include "utils.h"
 
 #if PG_VERSION_NUM >= 150000
 #include "common/pg_prng.h"
@@ -90,17 +91,6 @@ typedef enum IvfflatIterativeScanMode
 	IVFFLAT_ITERATIVE_SCAN_OFF,
 	IVFFLAT_ITERATIVE_SCAN_RELAXED
 }			IvfflatIterativeScanMode;
-
-typedef struct VectorArrayData
-{
-	int			length;
-	int			maxlen;
-	int			dim;
-	Size		itemsize;
-	char	   *items;
-}			VectorArrayData;
-
-typedef VectorArrayData * VectorArray;
 
 typedef struct ListInfo
 {
@@ -196,6 +186,12 @@ typedef struct IvfflatBuildState
 	VectorArray centers;
 	ListInfo   *listInfo;
 
+	VectorArray vectors; // add for the building process
+	int64_t lowest_vid;
+	int64_t *tids;
+	int      num_tids;
+	int      cap_tids;
+	void *ivfflatIndex; // add for storing the pointer to the index during the building phase
 #ifdef IVFFLAT_KMEANS_DEBUG
 	double		inertia;
 	double	   *listSums;
@@ -217,6 +213,9 @@ typedef struct IvfflatBuildState
 
 	/* Parallel builds */
 	IvfflatLeader *ivfleader;
+
+	/* Visibility slot*/
+	TupleDesc vitupdesc;
 }			IvfflatBuildState;
 
 typedef struct IvfflatMetaPageData
@@ -265,11 +264,11 @@ typedef struct IvfflatScanOpaqueData
 	MemoryContext tmpCtx;
 
 	/* Sorting */
-	Tuplesortstate *sortstate;
-	TupleDesc	tupdesc;
-	TupleTableSlot *vslot;
-	TupleTableSlot *mslot;
-	BufferAccessStrategy bas;
+	// Tuplesortstate *sortstate;
+	// TupleDesc	tupdesc;
+	// TupleTableSlot *vslot;
+	// TupleTableSlot *mslot;
+	// BufferAccessStrategy bas;
 
 	/* Support functions */
 	FmgrInfo   *procinfo;
@@ -278,29 +277,16 @@ typedef struct IvfflatScanOpaqueData
 	Datum		(*distfunc) (FmgrInfo *flinfo, Oid collation, Datum arg1, Datum arg2);
 
 	/* Lists */
-	pairingheap *listQueue;
-	BlockNumber *listPages;
-	int			listIndex;
-	IvfflatScanList *lists;
+	// pairingheap *listQueue;
+	// BlockNumber *listPages;
+	// int			listIndex;
+	// IvfflatScanList *lists;
+
+	TopKTuples topkTuples;
+	int topkTuplesIdx;
 }			IvfflatScanOpaqueData;
 
 typedef IvfflatScanOpaqueData * IvfflatScanOpaque;
-
-#define VECTOR_ARRAY_SIZE(_length, _size) (sizeof(VectorArrayData) + (_length) * MAXALIGN(_size))
-
-/* Use functions instead of macros to avoid double evaluation */
-
-static inline Pointer
-VectorArrayGet(VectorArray arr, int offset)
-{
-	return ((char *) arr->items) + (offset * arr->itemsize);
-}
-
-static inline void
-VectorArraySet(VectorArray arr, int offset, Pointer val)
-{
-	memcpy(VectorArrayGet(arr, offset), val, VARSIZE_ANY(val));
-}
 
 /* Methods */
 VectorArray VectorArrayInit(int maxlen, int dimensions, Size itemsize);

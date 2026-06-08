@@ -11,6 +11,7 @@
 #include "utils/relptr.h"
 #include "utils/sampling.h"
 #include "vector.h"
+#include "utils.h"
 
 #define HNSW_MAX_DIM 2000
 #define HNSW_MAX_NNZ 1000
@@ -41,7 +42,7 @@
 #define HNSW_MAX_EF_CONSTRUCTION		1000
 #define HNSW_DEFAULT_EF_SEARCH	40
 #define HNSW_MIN_EF_SEARCH		1
-#define HNSW_MAX_EF_SEARCH		1000
+#define HNSW_MAX_EF_SEARCH		2000
 
 /* Tuple types */
 #define HNSW_ELEMENT_TUPLE_TYPE  1
@@ -277,6 +278,7 @@ typedef struct HnswBuildState
 	int			m;
 	int			efConstruction;
 
+	// TODO: ???
 	/* Statistics */
 	double		indtuples;
 	double		reltuples;
@@ -284,21 +286,25 @@ typedef struct HnswBuildState
 	/* Support functions */
 	HnswSupport support;
 
-	/* Variables */
-	HnswGraph	graphData;
-	HnswGraph  *graph;
-	double		ml;
-	int			maxLevel;
-
 	/* Memory */
 	MemoryContext graphCtx;
 	MemoryContext tmpCtx;
-	HnswAllocator allocator;
 
 	/* Parallel builds */
-	HnswLeader *hnswleader;
-	HnswShared *hnswshared;
-	char	   *hnswarea;
+	// HnswLeader *hnswleader;
+	// HnswShared *hnswshared;
+	// char	   *hnswarea;
+
+	/* lsm index building */
+	VectorArray vectors; // add for the building process
+	int64_t *tids;
+	int      num_tids;
+	int      cap_tids;
+	void *hnswIndex; // add for storing the pointer to the index during the building phase
+	void *diskFileHandle; // add for storing the disk file handle for DiskANN builds
+
+	/* Visibility slot */
+	TupleDesc vitupdesc;
 }			HnswBuildState;
 
 typedef struct HnswMetaPageData
@@ -366,18 +372,21 @@ typedef struct HnswScanOpaqueData
 {
 	const		HnswTypeInfo *typeInfo;
 	bool		first;
-	List	   *w;
-	visited_hash v;
-	pairingheap *discarded;
-	HnswQuery	q;
-	int			m;
-	int64		tuples;
-	double		previousDistance;
+	// List	   *w;
+	// visited_hash v;
+	// pairingheap *discarded;
+	// HnswQuery	q;
+	// int			m;
+	// int64		tuples;
+	// double		previousDistance;
 	Size		maxMemory;
 	MemoryContext tmpCtx;
 
 	/* Support functions */
 	HnswSupport support;
+	
+	TopKTuples topkTuples;
+	int topkTuplesIdx;
 }			HnswScanOpaqueData;
 
 typedef HnswScanOpaqueData * HnswScanOpaque;
